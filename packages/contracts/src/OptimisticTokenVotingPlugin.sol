@@ -22,7 +22,7 @@ contract OptimisticTokenVotingPlugin is IMembership, MajorityVotingBase {
     using SafeCastUpgradeable for uint256;
 
     /// @notice The [ERC-165](https://eips.ethereum.org/EIPS/eip-165) interface ID of the contract.
-    bytes4 internal constant TOKEN_VOTING_INTERFACE_ID =
+    bytes4 internal constant OPTIMISTIC_TOKEN_VOTING_INTERFACE_ID =
         this.initialize.selector ^ this.getVotingToken.selector;
 
     /// @notice An [OpenZeppelin `Votes`](https://docs.openzeppelin.com/contracts/4.x/api/governance#Votes) compatible contract referencing the token being used for voting.
@@ -53,7 +53,7 @@ contract OptimisticTokenVotingPlugin is IMembership, MajorityVotingBase {
     /// @return Returns `true` if the interface is supported.
     function supportsInterface(bytes4 _interfaceId) public view virtual override returns (bool) {
         return
-            _interfaceId == TOKEN_VOTING_INTERFACE_ID ||
+            _interfaceId == OPTIMISTIC_TOKEN_VOTING_INTERFACE_ID ||
             _interfaceId == type(IMembership).interfaceId ||
             super.supportsInterface(_interfaceId);
     }
