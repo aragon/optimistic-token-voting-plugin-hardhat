@@ -15,7 +15,6 @@ import {PluginSetup, IPluginSetup} from "@aragon/osx/framework/plugin/setup/Plug
 import {GovernanceERC20} from "@aragon/osx/token/ERC20/governance/GovernanceERC20.sol";
 import {GovernanceWrappedERC20} from "@aragon/osx/token/ERC20/governance/GovernanceWrappedERC20.sol";
 import {IGovernanceWrappedERC20} from "@aragon/osx/token/ERC20/governance/IGovernanceWrappedERC20.sol";
-import {MajorityVotingBase} from "@aragon/osx/plugins/governance/majority-voting/MajorityVotingBase.sol";
 import {OptimisticTokenVotingPlugin} from "./OptimisticTokenVotingPlugin.sol";
 
 /// @title OptimisticTokenVotingPluginSetup
@@ -78,13 +77,17 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
         // Decode `_data` to extract the params needed for deploying and initializing `OptimisticTokenVoting` plugin,
         // and the required helpers
         (
-            MajorityVotingBase.VotingSettings memory votingSettings,
+            OptimisticTokenVotingPlugin.OptimisticGovernanceSettings memory votingSettings,
             TokenSettings memory tokenSettings,
             // only used for GovernanceERC20(token is not passed)
             GovernanceERC20.MintSettings memory mintSettings
         ) = abi.decode(
                 _data,
-                (MajorityVotingBase.VotingSettings, TokenSettings, GovernanceERC20.MintSettings)
+                (
+                    OptimisticTokenVotingPlugin.OptimisticGovernanceSettings,
+                    TokenSettings,
+                    GovernanceERC20.MintSettings
+                )
             );
 
         address token = tokenSettings.addr;
@@ -158,7 +161,8 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
             where: plugin,
             who: _dao,
             condition: PermissionLib.NO_CONDITION,
-            permissionId: optimisticTokenVotingPluginBase.UPDATE_VOTING_SETTINGS_PERMISSION_ID()
+            permissionId: optimisticTokenVotingPluginBase
+                .UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID()
         });
 
         permissions[1] = PermissionLib.MultiTargetPermission({
@@ -221,7 +225,8 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
             where: _payload.plugin,
             who: _dao,
             condition: PermissionLib.NO_CONDITION,
-            permissionId: optimisticTokenVotingPluginBase.UPDATE_VOTING_SETTINGS_PERMISSION_ID()
+            permissionId: optimisticTokenVotingPluginBase
+                .UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID()
         });
 
         permissions[1] = PermissionLib.MultiTargetPermission({

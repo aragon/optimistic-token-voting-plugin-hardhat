@@ -2,15 +2,16 @@
 
 pragma solidity ^0.8.8;
 
-/// @title IOptimisticMajority
+import {IVotesUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/utils/IVotesUpgradeable.sol";
+
+/// @title IOptimisticTokenVoting
 /// @author Aragon Association - 2022-2023
 /// @notice The interface of an optimistic governance plugin.
-interface IOptimisticMajority {
-    /// @notice Emitted when a veto is cast by a voter.
-    /// @param proposalId The ID of the proposal.
-    /// @param voter The voter casting the veto.
-    /// @param votingPower The voting power behind this veto.
-    event VetoCast(uint256 indexed proposalId, address indexed voter, uint256 votingPower);
+interface IOptimisticTokenVoting {
+    /// @notice getter function for the voting token.
+    /// @dev public function also useful for registering interfaceId and for distinguishing from majority voting interface.
+    /// @return The token used for voting.
+    function getVotingToken() external view returns (IVotesUpgradeable);
 
     /// @notice Returns the veto ratio parameter stored in the optimistic governance settings.
     /// @return The veto ratio parameter.
