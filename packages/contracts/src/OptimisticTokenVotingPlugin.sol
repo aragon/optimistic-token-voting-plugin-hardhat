@@ -34,12 +34,10 @@ contract OptimisticTokenVotingPlugin is
 
     /// @notice A container for the optimistic majority settings that will be applied as parameters on proposal creation.
     /// @param minVetoRatio The support threshold value. Its value has to be in the interval [0, 10^6] defined by `RATIO_BASE = 10**6`.
-    /// @param minParticipation The minimum participation value. Its value has to be in the interval [0, 10^6] defined by `RATIO_BASE = 10**6`.
     /// @param minDuration The minimum duration of the proposal vote in seconds.
     /// @param minProposerVotingPower The minimum vetoing power required to create a proposal.
     struct OptimisticGovernanceSettings {
         uint32 minVetoRatio;
-        uint32 minParticipation;
         uint64 minDuration;
         uint256 minProposerVotingPower;
     }
@@ -96,12 +94,10 @@ contract OptimisticTokenVotingPlugin is
 
     /// @notice Emitted when the vetoing settings are updated.
     /// @param minVetoRatio The support threshold value.
-    /// @param minParticipation The minimum participation value.
     /// @param minDuration The minimum duration of the proposal vote in seconds.
     /// @param minProposerVotingPower The minimum vetoing power required to create a proposal.
     event OptimisticGovernanceSettingsUpdated(
         uint32 minVetoRatio,
-        uint32 minParticipation,
         uint64 minDuration,
         uint256 minProposerVotingPower
     );
@@ -431,7 +427,6 @@ contract OptimisticTokenVotingPlugin is
 
         emit OptimisticGovernanceSettingsUpdated({
             minVetoRatio: _governanceSettings.minVetoRatio,
-            minParticipation: _governanceSettings.minParticipation,
             minDuration: _governanceSettings.minDuration,
             minProposerVotingPower: _governanceSettings.minProposerVotingPower
         });
