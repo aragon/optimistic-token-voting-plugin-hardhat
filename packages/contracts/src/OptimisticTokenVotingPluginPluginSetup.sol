@@ -72,21 +72,23 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
     /// @inheritdoc IPluginSetup
     function prepareInstallation(
         address _dao,
-        bytes calldata _data
+        bytes calldata _installParameters
     ) external returns (address plugin, PreparedSetupData memory preparedSetupData) {
-        // Decode `_data` to extract the params needed for deploying and initializing `OptimisticTokenVoting` plugin,
+        // Decode `_installParameters` to extract the params needed for deploying and initializing `OptimisticTokenVoting` plugin,
         // and the required helpers
         (
             OptimisticTokenVotingPlugin.OptimisticGovernanceSettings memory votingSettings,
             TokenSettings memory tokenSettings,
-            // only used for GovernanceERC20(token is not passed)
-            GovernanceERC20.MintSettings memory mintSettings
+            // only used for GovernanceERC20 (when token is not passed)
+            GovernanceERC20.MintSettings memory mintSettings,
+            address[] memory proposers
         ) = abi.decode(
-                _data,
+                _installParameters,
                 (
                     OptimisticTokenVotingPlugin.OptimisticGovernanceSettings,
                     TokenSettings,
-                    GovernanceERC20.MintSettings
+                    GovernanceERC20.MintSettings,
+                    address[]
                 )
             );
 
@@ -151,11 +153,12 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
         // Prepare permissions
         PermissionLib.MultiTargetPermission[]
             memory permissions = new PermissionLib.MultiTargetPermission[](
-                tokenSettings.addr != address(0) ? 3 : 4
+                tokenSettings.addr != address(0) ? 3 + proposers.length : 4 + proposers.length
             );
 
-        // Set plugin permissions to be granted.
-        // Grant the list of permissions of the plugin to the DAO.
+        // Request the permissions to be granted
+
+        // The DAO can update the plugin settings
         permissions[0] = PermissionLib.MultiTargetPermission({
             operation: PermissionLib.Operation.Grant,
             where: plugin,
@@ -165,6 +168,7 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
                 .UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID()
         });
 
+        // The DAO can upgrade the plugin implementation
         permissions[1] = PermissionLib.MultiTargetPermission({
             operation: PermissionLib.Operation.Grant,
             where: plugin,
@@ -173,7 +177,7 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
             permissionId: optimisticTokenVotingPluginBase.UPGRADE_PLUGIN_PERMISSION_ID()
         });
 
-        // Grant `EXECUTE_PERMISSION` of the DAO to the plugin.
+        // The plugin can make the DAO execute actions
         permissions[2] = PermissionLib.MultiTargetPermission({
             operation: PermissionLib.Operation.Grant,
             where: _dao,
@@ -182,10 +186,26 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
             permissionId: DAO(payable(_dao)).EXECUTE_PERMISSION_ID()
         });
 
+        // Proposers can create proposals
+        for (uint256 i = 0; i < proposers.length; ) {
+            permissions[3 + i] = PermissionLib.MultiTargetPermission({
+                operation: PermissionLib.Operation.Grant,
+                where: plugin,
+                who: proposers[i],
+                condition: PermissionLib.NO_CONDITION,
+                permissionId: optimisticTokenVotingPluginBase.PROPOSER_PERMISSION_ID()
+            });
+
+            unchecked {
+                i++;
+            }
+        }
+
         if (tokenSettings.addr == address(0)) {
             bytes32 tokenMintPermission = GovernanceERC20(token).MINT_PERMISSION_ID();
 
-            permissions[3] = PermissionLib.MultiTargetPermission({
+            // The DAO can mint ERC20 tokens
+            permissions[3 + proposers.length] = PermissionLib.MultiTargetPermission({
                 operation: PermissionLib.Operation.Grant,
                 where: token,
                 who: _dao,
@@ -244,6 +264,8 @@ contract OptimisticTokenVotingPluginSetup is PluginSetup {
             condition: PermissionLib.NO_CONDITION,
             permissionId: DAO(payable(_dao)).EXECUTE_PERMISSION_ID()
         });
+
+        // Note: It no longer matters if proposers can still create proposals
 
         // Revocation of permission is necessary only if the deployed token is GovernanceERC20,
         // as GovernanceWrapped does not possess this permission. Only return the following

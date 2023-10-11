@@ -72,18 +72,45 @@ contract OptimisticTokenVotingPlugin is
         uint64 snapshotBlock;
     }
 
+    /// @notice The ID of the permission required to create a proposal.
+    bytes32 public constant PROPOSER_PERMISSION_ID = keccak256("PROPOSER_PERMISSION");
+
     /// @notice The ID of the permission required to call the `updateOptimisticGovernanceSettings` function.
     bytes32 public constant UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID =
         keccak256("UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION");
 
-    /// @notice A mapping between proposal IDs and proposal information.
-    mapping(uint256 => Proposal) internal proposals;
+    /// @notice The [ERC-165](https://eips.ethereum.org/EIPS/eip-165) interface ID of the contract.
+    bytes4 internal constant OPTIMISTIC_GOVERNANCE_INTERFACE_ID =
+        this.initialize.selector ^
+            this.getProposal.selector ^
+            this.updateOptimisticGovernanceSettings.selector;
+
+    /// @notice An [OpenZeppelin `Votes`](https://docs.openzeppelin.com/contracts/4.x/api/governance#Votes) compatible contract referencing the token being used for voting.
+    IVotesUpgradeable private votingToken;
 
     /// @notice The struct storing the governance settings.
     OptimisticGovernanceSettings private governanceSettings;
 
-    /// @notice An [OpenZeppelin `Votes`](https://docs.openzeppelin.com/contracts/4.x/api/governance#Votes) compatible contract referencing the token being used for voting.
-    IVotesUpgradeable private votingToken;
+    /// @notice A mapping between proposal IDs and proposal information.
+    mapping(uint256 => Proposal) internal proposals;
+
+    /// @notice Emitted when the vetoing settings are updated.
+    /// @param minVetoRatio The support threshold value.
+    /// @param minParticipation The minimum participation value.
+    /// @param minDuration The minimum duration of the proposal vote in seconds.
+    /// @param minProposerVotingPower The minimum vetoing power required to create a proposal.
+    event OptimisticGovernanceSettingsUpdated(
+        uint32 minVetoRatio,
+        uint32 minParticipation,
+        uint64 minDuration,
+        uint256 minProposerVotingPower
+    );
+
+    /// @notice Emitted when a veto is cast by a voter.
+    /// @param proposalId The ID of the proposal.
+    /// @param voter The voter casting the veto.
+    /// @param votingPower The voting power behind this veto.
+    event VetoCast(uint256 indexed proposalId, address indexed voter, uint256 votingPower);
 
     /// @notice Thrown if a date is out of bounds.
     /// @param limit The limit value.
@@ -112,24 +139,6 @@ contract OptimisticTokenVotingPlugin is
     /// @param proposalId The ID of the proposal.
     error ProposalExecutionForbidden(uint256 proposalId);
 
-    /// @notice Emitted when the vetoing settings are updated.
-    /// @param minVetoRatio The support threshold value.
-    /// @param minParticipation The minimum participation value.
-    /// @param minDuration The minimum duration of the proposal vote in seconds.
-    /// @param minProposerVotingPower The minimum vetoing power required to create a proposal.
-    event OptimisticGovernanceSettingsUpdated(
-        uint32 minVetoRatio,
-        uint32 minParticipation,
-        uint64 minDuration,
-        uint256 minProposerVotingPower
-    );
-
-    /// @notice Emitted when a veto is cast by a voter.
-    /// @param proposalId The ID of the proposal.
-    /// @param voter The voter casting the veto.
-    /// @param votingPower The voting power behind this veto.
-    event VetoCast(uint256 indexed proposalId, address indexed voter, uint256 votingPower);
-
     /// @notice Thrown if the voting power is zero
     error NoVotingPower();
 
@@ -142,7 +151,7 @@ contract OptimisticTokenVotingPlugin is
         IDAO _dao,
         OptimisticGovernanceSettings calldata _governanceSettings,
         IVotesUpgradeable _token
-    ) public onlyInitializing {
+    ) external initializer {
         __PluginUUPSUpgradeable_init(_dao);
 
         votingToken = _token;
@@ -168,16 +177,12 @@ contract OptimisticTokenVotingPlugin is
             super.supportsInterface(_interfaceId);
     }
 
-    /// @notice getter function for the voting token.
-    /// @dev public function also useful for registering interfaceId and for distinguishing from majority voting interface.
-    /// @return The token used for voting.
+    /// @inheritdoc IOptimisticTokenVoting
     function getVotingToken() public view returns (IVotesUpgradeable) {
         return votingToken;
     }
 
-    /// @notice Returns the total voting power checkpointed for a specific block number.
-    /// @param _blockNumber The block number.
-    /// @return The total voting power.
+    /// @inheritdoc IOptimisticTokenVoting
     function totalVotingPower(uint256 _blockNumber) public view returns (uint256) {
         return votingToken.getPastTotalSupply(_blockNumber);
     }
@@ -204,7 +209,7 @@ contract OptimisticTokenVotingPlugin is
             return false;
         }
 
-        // The voter has already vetoed.
+        // The voter already vetoed.
         if (proposal_.vetoVoters[_voter]) {
             return false;
         }
@@ -253,14 +258,12 @@ contract OptimisticTokenVotingPlugin is
         return governanceSettings.minVetoRatio;
     }
 
-    /// @notice Returns the minimum duration parameter stored in the vetoing settings.
-    /// @return The minimum duration parameter.
+    /// @inheritdoc IOptimisticTokenVoting
     function minDuration() public view virtual returns (uint64) {
         return governanceSettings.minDuration;
     }
 
-    /// @notice Returns the minimum vetoing power required to create a proposal stored in the vetoing settings.
-    /// @return The minimum vetoing power required to create a proposal.
+    /// @inheritdoc IOptimisticTokenVoting
     function minProposerVotingPower() public view virtual returns (uint256) {
         return governanceSettings.minProposerVotingPower;
     }
@@ -298,20 +301,14 @@ contract OptimisticTokenVotingPlugin is
         allowFailureMap = proposal_.allowFailureMap;
     }
 
-    /// @notice Creates a new optimistic majority proposal.
-    /// @param _metadata The metadata of the proposal.
-    /// @param _actions The actions that will be executed after the proposal passes.
-    /// @param _allowFailureMap Allows proposal to succeed even if an action reverts. Uses bitmap representation. If the bit at index `x` is 1, the tx succeeds even if the action at `x` failed. Passing 0 will be treated as atomic execution.
-    /// @param _startDate The start date of the proposal vote. If 0, the current timestamp is used and the vote starts immediately.
-    /// @param _endDate The end date of the proposal vote. If 0, `_startDate + minDuration` is used.
-    /// @return proposalId The ID of the proposal.
+    /// @inheritdoc IOptimisticTokenVoting
     function createProposal(
         bytes calldata _metadata,
         IDAO.Action[] calldata _actions,
         uint256 _allowFailureMap,
         uint64 _startDate,
         uint64 _endDate
-    ) external returns (uint256 proposalId) {
+    ) external auth(PROPOSER_PERMISSION_ID) returns (uint256 proposalId) {
         // Check that either `_msgSender` owns enough tokens or has enough voting power from being a delegatee.
         {
             uint256 minProposerVotingPower_ = minProposerVotingPower();
@@ -358,7 +355,7 @@ contract OptimisticTokenVotingPlugin is
         proposal_.parameters.snapshotBlock = snapshotBlock.toUint64();
         proposal_.parameters.minVetoRatio = minVetoRatio();
 
-        // Reduce costs
+        // Save gas
         if (_allowFailureMap != 0) {
             proposal_.allowFailureMap = _allowFailureMap;
         }
@@ -384,7 +381,7 @@ contract OptimisticTokenVotingPlugin is
         // This could re-enter, though we can assume the governance token is not malicious
         uint256 votingPower = votingToken.getPastVotes(_voter, proposal_.parameters.snapshotBlock);
 
-        // Not checking if the voter already voted, since canVeto() above would have returned false
+        // Not checking if the voter already voted, since canVeto() above already did
 
         // Write the updated tally.
         proposal_.vetoTally += votingPower;
@@ -409,8 +406,8 @@ contract OptimisticTokenVotingPlugin is
         );
     }
 
-    /// @notice Updates the vetoing settings.
-    /// @param _governanceSettings The new vetoing settings.
+    /// @notice Updates the governance settings.
+    /// @param _governanceSettings The new governance settings.
     function updateOptimisticGovernanceSettings(
         OptimisticGovernanceSettings calldata _governanceSettings
     ) public virtual auth(UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID) {
