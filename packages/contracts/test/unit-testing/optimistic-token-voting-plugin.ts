@@ -40,6 +40,7 @@ import { deployWithProxy, findEvent, toBytes32 } from "../../utils/helpers";
 import { deployTestDao } from "../helpers/test-dao";
 import { ExecutedEvent } from "../../typechain/@aragon/osx/core/dao/DAO";
 import { getInterfaceID } from "../../utils/interfaces";
+import { start } from "repl";
 
 export const optimisticTokenVotingInterface = new ethers.utils.Interface([
   "function initialize(address,tuple(uint32,uint64,uint256),address)",
@@ -52,6 +53,7 @@ describe("OptimisticTokenVotingPlugin", function () {
   let alice: SignerWithAddress;
   let bob: SignerWithAddress;
   let charlie: SignerWithAddress;
+  let debbie: SignerWithAddress;
   let plugin: OptimisticTokenVotingPlugin;
   let dao: DAO;
   let governanceErc20Mock: GovernanceERC20Mock;
@@ -67,7 +69,7 @@ describe("OptimisticTokenVotingPlugin", function () {
 
   before(async () => {
     signers = await ethers.getSigners();
-    [alice, bob, charlie] = signers;
+    [alice, bob, charlie, debbie] = signers;
 
     dummyActions = [
       {
@@ -269,9 +271,9 @@ describe("OptimisticTokenVotingPlugin", function () {
   });
 
   describe("Proposal creation", async () => {
-    beforeEach(async () => {
-      await setBalances([{ receiver: alice.address, amount: 1 }]);
-      await setTotalSupply(1);
+    beforeEach(() => {
+      return setBalances([{ receiver: alice.address, amount: 1 }])
+        .then(() => setTotalSupply(1));
     });
 
     context("minProposerVotingPower == 0", async () => {
@@ -323,6 +325,8 @@ describe("OptimisticTokenVotingPlugin", function () {
       });
 
       it("reverts if `_msgSender` owns no tokens and has no tokens delegated to her/him in the current block", async () => {
+        await dao.grant(plugin.address, bob.address, PROPOSER_PERMISSION_ID);
+
         await setBalances([
           {
             receiver: bob.address,
@@ -358,6 +362,8 @@ describe("OptimisticTokenVotingPlugin", function () {
       });
 
       it("reverts if `_msgSender` owns no tokens and has no tokens delegated to her/him in the current block although having them in the last block", async () => {
+        await dao.grant(plugin.address, bob.address, PROPOSER_PERMISSION_ID);
+
         await setBalances([
           {
             receiver: alice.address,
@@ -448,6 +454,12 @@ describe("OptimisticTokenVotingPlugin", function () {
       });
 
       it("creates a proposal if `_msgSender` owns enough tokens  in the current block", async () => {
+        await dao.grant(
+          plugin.address,
+          charlie.address,
+          PROPOSER_PERMISSION_ID,
+        );
+
         await setBalances([
           {
             receiver: alice.address,
@@ -485,6 +497,12 @@ describe("OptimisticTokenVotingPlugin", function () {
       });
 
       it("creates a proposal if `_msgSender` owns enough tokens and has delegated them to someone else in the current block", async () => {
+        await dao.grant(
+          plugin.address,
+          charlie.address,
+          PROPOSER_PERMISSION_ID,
+        );
+
         await setBalances([
           {
             receiver: alice.address,
@@ -529,6 +547,12 @@ describe("OptimisticTokenVotingPlugin", function () {
       });
 
       it("creates a proposal if `_msgSender` owns no tokens but has enough tokens delegated to her/him in the current block", async () => {
+        await dao.grant(plugin.address, bob.address, PROPOSER_PERMISSION_ID);
+        await dao.grant(
+          plugin.address,
+          charlie.address,
+          PROPOSER_PERMISSION_ID,
+        );
         await setBalances([
           {
             receiver: alice.address,
@@ -570,6 +594,11 @@ describe("OptimisticTokenVotingPlugin", function () {
       });
 
       it("reverts if `_msgSender` doesn not own enough tokens herself/himself and has not tokens delegated to her/him in the current block", async () => {
+        await dao.grant(
+          plugin.address,
+          charlie.address,
+          PROPOSER_PERMISSION_ID,
+        );
         await setBalances([
           {
             receiver: alice.address,
@@ -865,8 +894,8 @@ describe("OptimisticTokenVotingPlugin", function () {
 
       const proposal = await plugin.getProposal(id);
 
-      expect(proposal.open).to.equal(true);
-      expect(proposal.executed).to.equal(false);
+      expect(proposal.open).to.be.true;
+      expect(proposal.executed).to.be.false;
       expect(proposal.allowFailureMap).to.equal(allowFailureMap);
 
       expect(proposal.parameters.minVetoVotingPower).to.equal(2); // 15% of 10 tokens ceiled => 2
@@ -882,10 +911,10 @@ describe("OptimisticTokenVotingPlugin", function () {
 
       expect(
         await plugin.canVeto(id, alice.address),
-      ).to.equal(true);
+      ).to.be.true;
       expect(
         await plugin.canVeto(id + 1, alice.address),
-      ).to.equal(false);
+      ).to.be.false;
 
       expect(proposal.actions.length).to.equal(1);
       expect(proposal.actions[0].to).to.equal(dummyActions[0].to);
@@ -895,26 +924,19 @@ describe("OptimisticTokenVotingPlugin", function () {
   });
 
   describe("Different scenarios:", async () => {
-    it("Should revert if minVetoRatio is zero", async () => {
-      governanceSettings.minVetoRatio = pctToRatio(0);
+    describe("minVetoRatio is 0%", () => {
+      it("Should revert", async () => {
+        governanceSettings.minVetoRatio = pctToRatio(0);
 
-      await expect(plugin.initialize(
-        dao.address,
-        governanceSettings,
-        governanceErc20Mock.address,
-      )).to.revertedWithCustomError(plugin, "RatioOutOfBounds");
-    });
-    it("Should revert if minVetoRatio > 100%", async () => {
-      governanceSettings.minVetoRatio = pctToRatio(101);
-
-      await expect(plugin.initialize(
-        dao.address,
-        governanceSettings,
-        governanceErc20Mock.address,
-      )).to.revertedWithCustomError(plugin, "RatioOutOfBounds");
+        await expect(plugin.initialize(
+          dao.address,
+          governanceSettings,
+          governanceErc20Mock.address,
+        )).to.revertedWithCustomError(plugin, "RatioOutOfBounds");
+      });
     });
 
-    describe("minVetoRatio is 5%", async () => {
+    describe("minVetoRatio is 15%", async () => {
       beforeEach(async () => {
         governanceSettings.minVetoRatio = pctToRatio(15);
 
@@ -947,108 +969,50 @@ describe("OptimisticTokenVotingPlugin", function () {
 
       it("executes if nobody vetoes", async () => {
         expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
+        expect(await plugin.canExecute(id)).to.be.false;
 
+        const proposal = await plugin.getProposal(id);
         await advanceAfterVoteEnd(endDate);
 
         expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(true);
-
+        expect(await plugin.canExecute(id)).to.be.true;
         await expect(plugin.execute(id)).to.not.be.reverted;
       });
 
       it("executes if not enough voters veto", async () => {
-        await plugin.connect(signers[0]).veto(id);
+        await plugin.connect(alice).veto(id);
 
         expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
+        expect(await plugin.canExecute(id)).to.be.false;
 
         await advanceAfterVoteEnd(endDate);
 
         expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(true);
+        expect(await plugin.canExecute(id)).to.be.true;
+        await expect(plugin.execute(id)).to.not.be.reverted;
       });
 
       it("does not execute if enough voters veto", async () => {
-        await plugin.connect(signers[0]).veto(id);
-
-        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
-
-        await plugin.connect(signers[1]).veto(id);
-
-        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
-        expect(await plugin.canExecute(id)).to.equal(false);
-
-        await advanceAfterVoteEnd(endDate);
-
-        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(true);
-      });
-
-      it("does not execute if support is high enough but participation is too low", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
         await plugin.connect(alice).veto(id);
 
-        expect(await plugin.isMinParticipationReached(id)).to.be.false;
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
 
-        expect(await plugin.canExecute(id)).to.equal(false);
+        await plugin.connect(bob).veto(id);
 
-        await advanceAfterVoteEnd(endDate);
-
-        expect(await plugin.isMinParticipationReached(id)).to.be.false;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
-        expect(await plugin.canExecute(id)).to.equal(false);
-      });
-
-      it("does not execute if participation is high enough but support is too low", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(plugin, id, signers, {
-          yes: [0], // 10 votes
-          no: [1, 2], //  20 votes
-          abstain: [], // 0 votes
-        });
-
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.false;
 
         await advanceAfterVoteEnd(endDate);
 
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
-      });
-
-      it("executes after the duration if participation and support are met", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(plugin, id, signers, {
-          yes: [0, 1, 2], // 30 votes
-          no: [], //  0 votes
-          abstain: [], // 0 votes
-        });
-
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
-
-        await advanceAfterVoteEnd(endDate);
-
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
-        expect(await plugin.canExecute(id)).to.equal(true);
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.false;
       });
     });
 
-    describe("An edge case with `supportThreshold = 0%`, `minParticipation = 0%`, in early execution mode", async () => {
+    describe("minVetoRatio is 25%", async () => {
       beforeEach(async () => {
-        governanceSettings.supportThreshold = pctToRatio(0);
-        governanceSettings.minParticipation = pctToRatio(0);
-        governanceSettings.votingMode = VotingMode.EarlyExecution;
+        governanceSettings.minVetoRatio = pctToRatio(25);
 
         await plugin.initialize(
           dao.address,
@@ -1056,7 +1020,16 @@ describe("OptimisticTokenVotingPlugin", function () {
           governanceErc20Mock.address,
         );
 
-        await setBalances([{ receiver: alice.address, amount: 1 }]);
+        const receivers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(
+          (i) => signers[i].address,
+        );
+        const amounts = Array(10).fill(10);
+        const balances = receivers.map((receiver, i) => ({
+          receiver: receiver,
+          amount: amounts[i],
+        }));
+
+        await setBalances(balances);
         await setTotalSupply(100);
 
         await plugin.createProposal(
@@ -1068,67 +1041,72 @@ describe("OptimisticTokenVotingPlugin", function () {
         );
       });
 
-      it("does not execute with 0 votes", async () => {
-        // does not execute early
-        await advanceIntoVoteTime(startDate, endDate);
+      it("executes if nobody vetoes", async () => {
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
 
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
-
-        // does not execute normally
+        const proposal = await plugin.getProposal(id);
         await advanceAfterVoteEnd(endDate);
 
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.false;
-        expect(await plugin.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.true;
+        await expect(plugin.execute(id)).to.not.be.reverted;
       });
 
-      it("executes if participation and support are met", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
+      it("executes if not enough voters veto", async () => {
         await plugin.connect(alice).veto(id);
+        await plugin.connect(bob).veto(id);
 
-        // Check if the proposal can execute early
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await plugin.canExecute(id)).to.equal(true);
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
 
-        // Check if the proposal can execute normally
         await advanceAfterVoteEnd(endDate);
 
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
-        expect(await plugin.canExecute(id)).to.equal(true);
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.true;
+        await expect(plugin.execute(id)).to.not.be.reverted;
+      });
+
+      it("does not execute if enough voters veto", async () => {
+        await plugin.connect(alice).veto(id);
+        await plugin.connect(bob).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
+
+        await plugin.connect(charlie).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.false;
+
+        await advanceAfterVoteEnd(endDate);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.false;
       });
     });
-  });
 
-  describe("An edge case with `supportThreshold = 99.9999%` and `minParticipation = 100%` in early execution mode", async () => {
-    beforeEach(async () => {
-      governanceSettings.supportThreshold = pctToRatio(100).sub(1);
-      governanceSettings.minParticipation = pctToRatio(100);
-      governanceSettings.votingMode = VotingMode.EarlyExecution;
-
-      await plugin.initialize(
-        dao.address,
-        governanceSettings,
-        governanceErc20Mock.address,
-      );
-    });
-
-    context("token balances are in the magnitude of 10^18", async () => {
+    describe("minVetoRatio is 50%", async () => {
       beforeEach(async () => {
-        const totalSupply = ethers.BigNumber.from(10).pow(18);
-        const delta = totalSupply.div(RATIO_BASE);
-        await setBalances([
-          {
-            receiver: alice.address,
-            amount: totalSupply.sub(delta), // 99.9999% of the total supply
-          },
-          { receiver: bob.address, amount: 1 }, // 1 vote (10^-16 % = 0.0000000000000001%)
-          { receiver: charlie.address, amount: delta.sub(1) }, // 1 vote less than 0.0001% of the total supply (99.9999% - 10^-16% = 0.00009999999999999%)
-        ]);
+        governanceSettings.minVetoRatio = pctToRatio(50);
+
+        await plugin.initialize(
+          dao.address,
+          governanceSettings,
+          governanceErc20Mock.address,
+        );
+
+        const receivers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(
+          (i) => signers[i].address,
+        );
+        const amounts = Array(10).fill(10);
+        const balances = receivers.map((receiver, i) => ({
+          receiver: receiver,
+          amount: amounts[i],
+        }));
+
+        await setBalances(balances);
+        await setTotalSupply(100);
 
         await plugin.createProposal(
           dummyMetadata,
@@ -1139,133 +1117,178 @@ describe("OptimisticTokenVotingPlugin", function () {
         );
       });
 
-      it("early support criterium is sharp by 1 vote", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
+      it("executes if nobody vetoes", async () => {
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
 
-        // 99.9999% of the plugin power voted for yes
-        await plugin.connect(alice).veto(id);
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
-
-        // 1 vote is still missing to meet >99.9999% worst case support
         const proposal = await plugin.getProposal(id);
-        const tally = proposal.tally;
-        const totalVotingPower = await plugin.totalVotingPower(
-          proposal.parameters.snapshotBlock,
-        );
-        expect(
-          totalVotingPower.sub(tally.yes).sub(tally.abstain), // this is the number of worst case no votes
-        ).to.eq(totalVotingPower.div(RATIO_BASE));
+        await advanceAfterVoteEnd(endDate);
 
-        // vote with 1 more yes vote
-        await plugin.connect(bob).veto(id);
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
-
-        // plugin with the remaining votes does not change this
-        await plugin.connect(charlie).veto(id);
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.true;
+        await expect(plugin.execute(id)).to.not.be.reverted;
       });
 
-      it("participation criterium is sharp by 1 vote", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
+      it("executes if not enough voters veto", async () => {
         await plugin.connect(alice).veto(id);
-        await plugin.connect(charlie).veto(id);
-
-        // 1 vote is still missing to meet particpiation = 100%
-        const proposal = await plugin.getProposal(id);
-        const tally = proposal.tally;
-        const totalVotingPower = await plugin.totalVotingPower(
-          proposal.parameters.snapshotBlock,
-        );
-        expect(
-          totalVotingPower.sub(tally.yes).sub(tally.no).sub(tally.abstain),
-        ).to.eq(1);
-        expect(await plugin.isMinParticipationReached(id)).to.be.false;
-
-        // cast the last vote so that participation = 100%
         await plugin.connect(bob).veto(id);
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        await plugin.connect(charlie).veto(id);
+        await plugin.connect(debbie).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
+
+        await advanceAfterVoteEnd(endDate);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.true;
+        await expect(plugin.execute(id)).to.not.be.reverted;
+      });
+
+      it("does not execute if enough voters veto", async () => {
+        await plugin.connect(alice).veto(id);
+        await plugin.connect(bob).veto(id);
+        await plugin.connect(charlie).veto(id);
+        await plugin.connect(debbie).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
+
+        await plugin.connect(signers[4]).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.false;
+
+        await advanceAfterVoteEnd(endDate);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.false;
       });
     });
 
-    context("tokens balances are in the magnitude of 10^6", async () => {
-      const totalSupply = ethers.BigNumber.from(10).pow(6);
-      const delta = 1; // 0.0001% of the total supply
-
+    describe("minVetoRatio is 100%", async () => {
       beforeEach(async () => {
-        await setBalances([
-          { receiver: alice.address, amount: totalSupply.sub(delta) }, // 99.9999%
-          { receiver: bob.address, amount: delta }, //             0.0001%
-        ]);
+        governanceSettings.minVetoRatio = pctToRatio(100);
 
-        await plugin.createProposal(
-          dummyMetadata,
-          dummyActions,
-          0,
-          0,
-          0,
+        await plugin.initialize(
+          dao.address,
+          governanceSettings,
+          governanceErc20Mock.address,
         );
       });
 
-      it("early support criterium is sharp by 1 vote", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
+      context("token balances are in the magnitude of 10^18", async () => {
+        beforeEach(async () => {
+          const totalSupply = ethers.BigNumber.from(10).pow(18);
+          const ratioUnit = totalSupply.div(RATIO_BASE);
+          await setBalances([
+            {
+              receiver: alice.address,
+              amount: totalSupply.sub(ratioUnit), // 99.9999% of the total supply
+            },
+            { receiver: bob.address, amount: 1 }, // 1 vote (10^-16 % = 0.0000000000000001%)
+            { receiver: charlie.address, amount: ratioUnit.sub(1) }, // 1 vote less than 0.0001% of the total supply (99.9999% - 10^-16% = 0.00009999999999999%)
+          ]);
 
-        await plugin.connect(alice).veto(id);
+          await plugin.createProposal(
+            dummyMetadata,
+            dummyActions,
+            0,
+            0,
+            0,
+          );
+        });
 
-        // 1 vote is still missing to meet >99.9999%
-        const proposal = await plugin.getProposal(id);
-        const tally = proposal.tally;
-        const totalVotingPower = await plugin.totalVotingPower(
-          proposal.parameters.snapshotBlock,
-        );
-        expect(
-          totalVotingPower.sub(tally.yes).sub(tally.abstain), // this is the number of worst case no votes
-        ).to.eq(totalVotingPower.div(RATIO_BASE));
+        it("early support criterium is sharp by 1 vote", async () => {
+          await advanceIntoVoteTime(startDate, endDate);
+          expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
 
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
+          // 99.9999% of the plugin power voted for yes
+          await plugin.connect(alice).veto(id);
+          expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
 
-        // cast the last vote so that support = 100%
-        await plugin.connect(bob).veto(id);
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
+          // 1 vote is still missing to meet >99.9999% worst case support
+          const proposal = await plugin.getProposal(id);
+          const totalVotingPower = await plugin.totalVotingPower(
+            proposal.parameters.snapshotBlock,
+          );
+          expect(
+            totalVotingPower.sub(proposal.vetoTally),
+          ).to.eq(totalVotingPower.div(RATIO_BASE));
+
+          // veto with 1 more vote
+          await plugin.connect(bob).veto(id);
+          expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+
+          // veto with the rest
+          await plugin.connect(charlie).veto(id);
+          expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        });
       });
 
-      it("participation is not met with 1 vote missing", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
+      context("tokens balances are in the magnitude of 10^6", async () => {
+        const totalSupply = ethers.BigNumber.from(10).pow(6);
+        const ratioUnit = 1; // 0.0001% of the total supply
 
-        await plugin.connect(alice).veto(id);
-        expect(await plugin.isMinParticipationReached(id)).to.be.false;
+        beforeEach(async () => {
+          await setBalances([
+            { receiver: alice.address, amount: totalSupply.sub(ratioUnit) }, // 99.9999%
+            { receiver: bob.address, amount: ratioUnit }, //             0.0001%
+          ]);
 
-        // 1 vote is still missing to meet particpiation = 100%
-        const proposal = await plugin.getProposal(id);
-        const tally = proposal.tally;
-        const totalVotingPower = await plugin.totalVotingPower(
-          proposal.parameters.snapshotBlock,
-        );
-        expect(
-          totalVotingPower.sub(tally.yes).sub(tally.no).sub(tally.abstain),
-        ).to.eq(1);
-        expect(await plugin.isMinParticipationReached(id)).to.be.false;
+          await plugin.createProposal(
+            dummyMetadata,
+            dummyActions,
+            0,
+            0,
+            0,
+          );
+        });
 
-        // cast the last vote so that participation = 100%
-        await plugin.connect(bob).veto(id);
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        it("early support criterium is sharp by 1 vote", async () => {
+          await advanceIntoVoteTime(startDate, endDate);
+
+          expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+          await plugin.connect(alice).veto(id);
+          expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+
+          // 1 vote is still missing to meet >99.9999%
+          const proposal = await plugin.getProposal(id);
+          const totalVotingPower = await plugin.totalVotingPower(
+            proposal.parameters.snapshotBlock,
+          );
+          expect(
+            totalVotingPower.sub(proposal.vetoTally),
+          ).to.eq(totalVotingPower.div(RATIO_BASE));
+
+          // cast the last vote so that veto = 100%
+          await plugin.connect(bob).veto(id);
+          expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        });
+      });
+    });
+
+    describe("minVetoRatio > 100%", () => {
+      it("Should revert", async () => {
+        governanceSettings.minVetoRatio = pctToRatio(101);
+
+        await expect(plugin.initialize(
+          dao.address,
+          governanceSettings,
+          governanceErc20Mock.address,
+        )).to.revertedWithCustomError(plugin, "RatioOutOfBounds");
       });
     });
   });
 
-  describe("Execution criteria handle token balances for multiple orders of magnitude", async function () {
-    beforeEach(async () => {
-      governanceSettings.minVetoRatio = pctToRatio(20);
+  describe("Execution criteria handle token balances for multiple orders of magnitude", function () {
+    beforeEach(() => {
+      governanceSettings.minVetoRatio = pctToRatio(15);
     });
 
     const powers = [0, 1, 2, 3, 6, 12, 18, 24, 36, 48];
 
-    powers.forEach(async (power) => {
+    powers.forEach((power) => {
       it(`magnitudes of 10^${power}`, async function () {
         await plugin.initialize(
           dao.address,
@@ -1308,14 +1331,15 @@ describe("OptimisticTokenVotingPlugin", function () {
           balances[0].amount.add(balances[1].amount),
         );
 
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.be.false;
+
         // vote with both signers
         await plugin.connect(alice).veto(id);
         await plugin.connect(bob).veto(id);
 
-        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
-        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await plugin.isMinParticipationReached(id)).to.be.true;
-        expect(await plugin.canExecute(id)).to.be.true;
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.false;
       });
     });
   });

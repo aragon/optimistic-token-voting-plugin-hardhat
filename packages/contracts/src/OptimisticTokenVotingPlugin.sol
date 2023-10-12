@@ -232,7 +232,7 @@ contract OptimisticTokenVotingPlugin is
             return false;
         }
         // Check that not enough voters have vetoed the proposal
-        else if (!isMinVetoRatioReached(_proposalId)) {
+        else if (isMinVetoRatioReached(_proposalId)) {
             return false;
         }
 
