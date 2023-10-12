@@ -8,14 +8,13 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {SafeCastUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeCastUpgradeable.sol";
 import {IVotesUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/utils/IVotesUpgradeable.sol";
 import {IMembership} from "@aragon/osx/core/plugin/membership/IMembership.sol";
+import {IOptimisticTokenVoting} from "./IOptimisticTokenVoting.sol";
 
-import {IProposal} from "@aragon/osx/core/plugin/proposal/IProposal.sol";
 import {ProposalUpgradeable} from "@aragon/osx/core/plugin/proposal/ProposalUpgradeable.sol";
 import {PluginUUPSUpgradeable} from "@aragon/osx/core/plugin/PluginUUPSUpgradeable.sol";
 import {RATIO_BASE, _applyRatioCeiled} from "@aragon/osx/plugins/utils/Ratio.sol";
 import {IDAO} from "@aragon/osx/core/dao/IDAO.sol";
 import {RATIO_BASE, RatioOutOfBounds} from "@aragon/osx/plugins/utils/Ratio.sol";
-import {IOptimisticTokenVoting} from "./IOptimisticTokenVoting.sol";
 
 /// @title OptimisticTokenVotingPlugin
 /// @author Aragon Association - 2022-2023
@@ -24,9 +23,9 @@ import {IOptimisticTokenVoting} from "./IOptimisticTokenVoting.sol";
 /// @dev This contract implements the `IOptimisticTokenVoting` interface.
 contract OptimisticTokenVotingPlugin is
     IOptimisticTokenVoting,
+    IMembership,
     Initializable,
     ERC165Upgradeable,
-    IMembership,
     PluginUUPSUpgradeable,
     ProposalUpgradeable
 {
@@ -59,15 +58,15 @@ contract OptimisticTokenVotingPlugin is
     }
 
     /// @notice A container for the proposal parameters at the time of proposal creation.
-    /// @param minVetoRatio The minimum ratio of the voting power needed to defeat the proposal. The value has to be within the interval [0, 10^6] defined by `RATIO_BASE = 10**6`.
     /// @param startDate The start date of the proposal vote.
     /// @param endDate The end date of the proposal vote.
     /// @param snapshotBlock The number of the block prior to the proposal creation.
+    /// @param minVetoVotingPower The minimum voting power needed to defeat the proposal.
     struct ProposalParameters {
-        uint32 minVetoRatio;
         uint64 startDate;
         uint64 endDate;
         uint64 snapshotBlock;
+        uint256 minVetoVotingPower;
     }
 
     /// @notice The ID of the permission required to create a proposal.
@@ -152,7 +151,7 @@ contract OptimisticTokenVotingPlugin is
 
         votingToken = _token;
 
-        updateOptimisticGovernanceSettings(_governanceSettings);
+        _updateOptimisticGovernanceSettings(_governanceSettings);
         emit MembershipContractAnnounced({definingContract: address(_token)});
     }
 
@@ -169,7 +168,9 @@ contract OptimisticTokenVotingPlugin is
         returns (bool)
     {
         return
+            _interfaceId == OPTIMISTIC_GOVERNANCE_INTERFACE_ID ||
             _interfaceId == type(IOptimisticTokenVoting).interfaceId ||
+            _interfaceId == type(IMembership).interfaceId ||
             super.supportsInterface(_interfaceId);
     }
 
@@ -241,12 +242,8 @@ contract OptimisticTokenVotingPlugin is
     /// @inheritdoc IOptimisticTokenVoting
     function isMinVetoRatioReached(uint256 _proposalId) public view virtual returns (bool) {
         Proposal storage proposal_ = proposals[_proposalId];
-        uint256 _minVetoPower = _applyRatioCeiled(
-            totalVotingPower(proposal_.parameters.snapshotBlock),
-            proposal_.parameters.minVetoRatio
-        );
 
-        return proposal_.vetoTally >= _minVetoPower;
+        return proposal_.vetoTally >= proposal_.parameters.minVetoVotingPower;
     }
 
     /// @inheritdoc IOptimisticTokenVoting
@@ -269,7 +266,7 @@ contract OptimisticTokenVotingPlugin is
     /// @return open Whether the proposal is open or not.
     /// @return executed Whether the proposal is executed or not.
     /// @return parameters The parameters of the proposal vote.
-    /// @return vetoPower The current voting power used to veto the proposal.
+    /// @return vetoTally The current voting power used to veto the proposal.
     /// @return actions The actions to be executed in the associated DAO after the proposal has passed.
     /// @return allowFailureMap The bit map representations of which actions are allowed to revert so tx still succeeds.
     function getProposal(
@@ -282,7 +279,7 @@ contract OptimisticTokenVotingPlugin is
             bool open,
             bool executed,
             ProposalParameters memory parameters,
-            uint256 vetoPower,
+            uint256 vetoTally,
             IDAO.Action[] memory actions,
             uint256 allowFailureMap
         )
@@ -292,7 +289,7 @@ contract OptimisticTokenVotingPlugin is
         open = _isProposalOpen(proposal_);
         executed = proposal_.executed;
         parameters = proposal_.parameters;
-        vetoPower = proposal_.vetoTally;
+        vetoTally = proposal_.vetoTally;
         actions = proposal_.actions;
         allowFailureMap = proposal_.allowFailureMap;
     }
@@ -349,7 +346,10 @@ contract OptimisticTokenVotingPlugin is
         proposal_.parameters.startDate = _startDate;
         proposal_.parameters.endDate = _endDate;
         proposal_.parameters.snapshotBlock = snapshotBlock.toUint64();
-        proposal_.parameters.minVetoRatio = minVetoRatio();
+        proposal_.parameters.minVetoVotingPower = _applyRatioCeiled(
+            totalVotingPower_,
+            minVetoRatio()
+        );
 
         // Save gas
         if (_allowFailureMap != 0) {
@@ -407,8 +407,17 @@ contract OptimisticTokenVotingPlugin is
     function updateOptimisticGovernanceSettings(
         OptimisticGovernanceSettings calldata _governanceSettings
     ) public virtual auth(UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID) {
+        _updateOptimisticGovernanceSettings(_governanceSettings);
+    }
+
+    /// @notice Internal implementation
+    function _updateOptimisticGovernanceSettings(
+        OptimisticGovernanceSettings calldata _governanceSettings
+    ) internal {
         // Require the minimum veto ratio value to be in the interval [0, 10^6], because `>=` comparision is used.
-        if (_governanceSettings.minVetoRatio > RATIO_BASE) {
+        if (_governanceSettings.minVetoRatio == 0) {
+            revert RatioOutOfBounds({limit: 1, actual: _governanceSettings.minVetoRatio});
+        } else if (_governanceSettings.minVetoRatio > RATIO_BASE) {
             revert RatioOutOfBounds({limit: RATIO_BASE, actual: _governanceSettings.minVetoRatio});
         }
 

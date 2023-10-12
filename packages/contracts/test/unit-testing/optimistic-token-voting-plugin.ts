@@ -6,19 +6,18 @@ import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
 import {
   DAO,
   DAO__factory,
-  GovernanceERC20Mock,
-  GovernanceERC20Mock__factory,
   IERC165Upgradeable__factory,
-  IMajorityVoting__factory,
   IMembership__factory,
+  IOptimisticTokenVoting__factory,
   IPlugin__factory,
   IProposal__factory,
-  IProtocolVersion__factory,
   OptimisticTokenVotingPlugin,
   OptimisticTokenVotingPlugin__factory,
 } from "../../typechain";
-import { OptimisticTokenVotingPlugin__factory as OptimisticTokenVotingPlugin_V1_0_0__factory } from "../../typechain/@aragon/osx-v1.0.1/plugins/governance/majority-voting/token/OptimisticTokenVotingPlugin.sol";
-import { OptimisticTokenVotingPlugin__factory as OptimisticTokenVotingPlugin_V1_3_0__factory } from "../../typechain/@aragon/osx-v1.3.0-rc0.2/plugins/governance/majority-voting/token/OptimisticTokenVotingPlugin.sol";
+import {
+  GovernanceERC20Mock,
+  GovernanceERC20Mock__factory,
+} from "@aragon/osx-ethers";
 
 import {
   ProposalCreatedEvent,
@@ -26,52 +25,34 @@ import {
 } from "../../typechain/src/OptimisticTokenVotingPlugin";
 
 import {
-  DAO_EVENTS,
-  findEvent,
-  findEventTopicLog,
-  MEMBERSHIP_EVENTS,
-  PROPOSAL_EVENTS,
-  VOTING_EVENTS,
-} from "../../utils/event";
-import {
+  ADDRESS_ONE,
   advanceAfterVoteEnd,
   advanceIntoVoteTime,
   getTime,
   MAX_UINT64,
-  ONE_HOUR,
+  ONE_WEEK,
+  OptimisticGovernanceSettings,
   pctToRatio,
+  PROPOSER_PERMISSION_ID,
   RATIO_BASE,
-  toBytes32,
-  VoteOption,
-  voteWithSigners,
-  VotingMode,
-  VotingSettings,
-} from "../../../../test-utils/voting";
-import { deployNewDAO } from "../../../../test-utils/dao";
-import { OZ_ERRORS } from "../../../../test-utils/error";
-import { deployWithProxy } from "../../../../test-utils/proxy";
-import {
-  getInterfaceID,
-  TOKEN_VOTING_INTERFACE,
-} from "../../../../test-utils/interfaces";
-import { TOKEN_VOTING_INTERFACE_ID } from "../../../../../../subgraph/src/utils/constants";
+} from "./common";
+import { deployWithProxy, findEvent, toBytes32 } from "../../utils/helpers";
+import { deployTestDao } from "../helpers/test-dao";
+import { ExecutedEvent } from "../../typechain/@aragon/osx/core/dao/DAO";
+import { getInterfaceID } from "../../utils/interfaces";
 
-import { UPGRADE_PERMISSIONS } from "../../../../test-utils/permissions";
-import {
-  deployAndUpgradeFromToCheck,
-  deployAndUpgradeSelfCheck,
-  getProtocolVersion,
-} from "../../../../test-utils/uups-upgradeable";
-import { majorityVotingBaseInterface } from "../majority-voting";
-import {
-  CURRENT_PROTOCOL_VERSION,
-  IMPLICIT_INITIAL_PROTOCOL_VERSION,
-} from "../../../../test-utils/protocol-version";
-import { ExecutedEvent } from "../../../../../typechain/DAO";
+export const optimisticTokenVotingInterface = new ethers.utils.Interface([
+  "function initialize(address,tuple(uint32,uint64,uint256),address)",
+  "function getProposal(uint256)",
+  "function updateOptimisticGovernanceSettings(tuple(uint32,uint64,uint256))",
+]);
 
 describe("OptimisticTokenVotingPlugin", function () {
   let signers: SignerWithAddress[];
-  let voting: OptimisticTokenVotingPlugin;
+  let alice: SignerWithAddress;
+  let bob: SignerWithAddress;
+  let charlie: SignerWithAddress;
+  let plugin: OptimisticTokenVotingPlugin;
   let dao: DAO;
   let governanceErc20Mock: GovernanceERC20Mock;
   let GovernanceERC20Mock: GovernanceERC20Mock__factory;
@@ -79,17 +60,18 @@ describe("OptimisticTokenVotingPlugin", function () {
   let dummyMetadata: string;
   let startDate: number;
   let endDate: number;
-  let votingSettings: VotingSettings;
+  let governanceSettings: OptimisticGovernanceSettings;
 
   const startOffset = 20;
   const id = 0;
 
   before(async () => {
     signers = await ethers.getSigners();
+    [alice, bob, charlie] = signers;
 
     dummyActions = [
       {
-        to: signers[0].address,
+        to: alice.address,
         data: "0x00000000",
         value: 0,
       },
@@ -99,23 +81,21 @@ describe("OptimisticTokenVotingPlugin", function () {
       ethers.utils.toUtf8Bytes("0x123456789"),
     );
 
-    dao = await deployNewDAO(signers[0]);
+    dao = await deployTestDao(alice);
   });
 
-  beforeEach(async function () {
-    votingSettings = {
-      votingMode: VotingMode.EarlyExecution,
-      supportThreshold: pctToRatio(50),
-      minParticipation: pctToRatio(20),
-      minDuration: ONE_HOUR,
+  beforeEach(async () => {
+    governanceSettings = {
+      minVetoRatio: pctToRatio(5),
+      minDuration: ONE_WEEK,
       minProposerVotingPower: 0,
     };
 
-    GovernanceERC20Mock = new GovernanceERC20Mock__factory(signers[0]);
+    GovernanceERC20Mock = new GovernanceERC20Mock__factory(alice);
     governanceErc20Mock = await GovernanceERC20Mock.deploy(
       dao.address,
-      "GOV",
-      "GOV",
+      "OPT",
+      "OPT",
       {
         receivers: [],
         amounts: [],
@@ -124,324 +104,220 @@ describe("OptimisticTokenVotingPlugin", function () {
 
     const OptimisticTokenVotingPluginFactory =
       new OptimisticTokenVotingPlugin__factory(
-        signers[0],
+        alice,
       );
 
-    voting = await deployWithProxy(OptimisticTokenVotingPluginFactory);
+    plugin = await deployWithProxy(OptimisticTokenVotingPluginFactory);
 
     startDate = (await getTime()) + startOffset;
-    endDate = startDate + votingSettings.minDuration;
+    endDate = startDate + governanceSettings.minDuration;
 
+    // The plugin can execute on the DAO
     dao.grant(
       dao.address,
-      voting.address,
+      plugin.address,
       ethers.utils.id("EXECUTE_PERMISSION"),
+    );
+    // Alice can create proposals
+    dao.grant(
+      plugin.address,
+      alice.address,
+      PROPOSER_PERMISSION_ID,
     );
   });
 
-  async function setBalances(
+  // Helpers
+
+  function setBalances(
     balances: { receiver: string; amount: number | BigNumber }[],
   ) {
-    const promises = balances.map((balance) =>
-      governanceErc20Mock.setBalance(balance.receiver, balance.amount)
+    return Promise.all(
+      balances.map((balance) =>
+        governanceErc20Mock.setBalance(balance.receiver, balance.amount)
+      ),
     );
-    await Promise.all(promises);
   }
 
-  async function setTotalSupply(totalSupply: number) {
+  async function setTotalSupply(newTotalSupply: number) {
     await ethers.provider.send("evm_mine", []);
-    let block = await ethers.provider.getBlock("latest");
+    const block = await ethers.provider.getBlock("latest");
 
-    const currentTotalSupply: BigNumber = await governanceErc20Mock
+    const currentTotalSupply = await governanceErc20Mock
       .getPastTotalSupply(block.number - 1);
 
+    const bnNewTotalSupply = BigNumber.from(newTotalSupply);
+    if (bnNewTotalSupply.lt(currentTotalSupply)) {
+      throw new Error("Cannot decrease the supply");
+    }
+
     await governanceErc20Mock.setBalance(
-      `0x${"0".repeat(39)}1`, // address(1)
-      BigNumber.from(totalSupply).sub(currentTotalSupply),
+      ADDRESS_ONE, // address(1)
+      bnNewTotalSupply.sub(currentTotalSupply),
     );
   }
+
+  // Tests
 
   describe("initialize: ", async () => {
     it("reverts if trying to re-initialize", async () => {
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
       await expect(
-        voting.initialize(
+        plugin.initialize(
           dao.address,
-          votingSettings,
+          governanceSettings,
           governanceErc20Mock.address,
         ),
-      ).to.be.revertedWith(OZ_ERRORS.ALREADY_INITIALIZED);
+      ).to.be.revertedWith("Initializable: contract is already initialized");
     });
 
     it("emits the `MembershipContractAnnounced` event", async () => {
       await expect(
-        await voting.initialize(
+        await plugin.initialize(
           dao.address,
-          votingSettings,
+          governanceSettings,
           governanceErc20Mock.address,
         ),
       )
-        .to.emit(voting, MEMBERSHIP_EVENTS.MEMBERSHIP_CONTRACT_ANNOUNCED)
+        .to.emit(plugin, "MembershipContractAnnounced")
         .withArgs(governanceErc20Mock.address);
-    });
-
-    it("reverts if trying to re-initialize", async () => {
-      await voting.initialize(
-        dao.address,
-        votingSettings,
-        governanceErc20Mock.address,
-      );
-
-      await expect(
-        voting.initialize(
-          dao.address,
-          votingSettings,
-          governanceErc20Mock.address,
-        ),
-      ).to.be.revertedWith(OZ_ERRORS.ALREADY_INITIALIZED);
-    });
-  });
-
-  describe("Upgrades", () => {
-    let legacyContractFactory: ContractFactory;
-    let currentContractFactory: ContractFactory;
-    let initArgs: any;
-
-    before(() => {
-      currentContractFactory = new OptimisticTokenVotingPlugin__factory(
-        signers[0],
-      );
-    });
-
-    beforeEach(() => {
-      initArgs = {
-        dao: dao.address,
-        votingSettings: votingSettings,
-        token: governanceErc20Mock.address,
-      };
-    });
-
-    it("upgrades to a new implementation", async () => {
-      await deployAndUpgradeSelfCheck(
-        signers[0],
-        signers[1],
-        initArgs,
-        "initialize",
-        currentContractFactory,
-        UPGRADE_PERMISSIONS.UPGRADE_PLUGIN_PERMISSION_ID,
-        dao,
-      );
-    });
-
-    it("upgrades from v1.0.0", async () => {
-      legacyContractFactory = new OptimisticTokenVotingPlugin_V1_0_0__factory(
-        signers[0],
-      );
-
-      const { fromImplementation, toImplementation } =
-        await deployAndUpgradeFromToCheck(
-          signers[0],
-          signers[1],
-          initArgs,
-          "initialize",
-          legacyContractFactory,
-          currentContractFactory,
-          UPGRADE_PERMISSIONS.UPGRADE_PLUGIN_PERMISSION_ID,
-          dao,
-        );
-      expect(toImplementation).to.not.equal(fromImplementation); // The build did change
-
-      const fromProtocolVersion = await getProtocolVersion(
-        legacyContractFactory.attach(fromImplementation),
-      );
-      const toProtocolVersion = await getProtocolVersion(
-        currentContractFactory.attach(toImplementation),
-      );
-      expect(fromProtocolVersion).to.not.deep.equal(toProtocolVersion);
-      expect(fromProtocolVersion).to.deep.equal(
-        IMPLICIT_INITIAL_PROTOCOL_VERSION,
-      );
-      expect(toProtocolVersion).to.deep.equal(CURRENT_PROTOCOL_VERSION);
-    });
-
-    it("from v1.3.0", async () => {
-      legacyContractFactory = new OptimisticTokenVotingPlugin_V1_3_0__factory(
-        signers[0],
-      );
-
-      const { fromImplementation, toImplementation } =
-        await deployAndUpgradeFromToCheck(
-          signers[0],
-          signers[1],
-          initArgs,
-          "initialize",
-          legacyContractFactory,
-          currentContractFactory,
-          UPGRADE_PERMISSIONS.UPGRADE_PLUGIN_PERMISSION_ID,
-          dao,
-        );
-      expect(toImplementation).to.not.equal(fromImplementation);
-
-      const fromProtocolVersion = await getProtocolVersion(
-        legacyContractFactory.attach(fromImplementation),
-      );
-      const toProtocolVersion = await getProtocolVersion(
-        currentContractFactory.attach(toImplementation),
-      );
-      expect(fromProtocolVersion).to.not.deep.equal(toProtocolVersion);
-      expect(fromProtocolVersion).to.deep.equal(
-        IMPLICIT_INITIAL_PROTOCOL_VERSION,
-      );
-      expect(toProtocolVersion).to.deep.equal(CURRENT_PROTOCOL_VERSION);
     });
   });
 
   describe("ERC-165", async () => {
     it("does not support the empty interface", async () => {
-      expect(await voting.supportsInterface("0xffffffff")).to.be.false;
+      expect(await plugin.supportsInterface("0xffffffff")).to.be.false;
     });
 
     it("supports the `IERC165Upgradeable` interface", async () => {
       const iface = IERC165Upgradeable__factory.createInterface();
-      expect(await voting.supportsInterface(getInterfaceID(iface))).to.be.true;
+      expect(await plugin.supportsInterface(getInterfaceID(iface))).to.be.true;
     });
 
     it("supports the `IPlugin` interface", async () => {
       const iface = IPlugin__factory.createInterface();
-      expect(await voting.supportsInterface(getInterfaceID(iface))).to.be.true;
-    });
-
-    it("supports the `IProtocolVersion` interface", async () => {
-      const iface = IProtocolVersion__factory.createInterface();
-      expect(await voting.supportsInterface(getInterfaceID(iface))).to.be.true;
+      expect(await plugin.supportsInterface(getInterfaceID(iface))).to.be.true;
     });
 
     it("supports the `IProposal` interface", async () => {
       const iface = IProposal__factory.createInterface();
-      expect(await voting.supportsInterface(getInterfaceID(iface))).to.be.true;
+      expect(await plugin.supportsInterface(getInterfaceID(iface))).to.be.true;
     });
 
     it("supports the `IMembership` interface", async () => {
       const iface = IMembership__factory.createInterface();
-      expect(await voting.supportsInterface(getInterfaceID(iface))).to.be.true;
+      expect(await plugin.supportsInterface(getInterfaceID(iface))).to.be.true;
     });
 
-    it("supports the `IMajorityVoting` interface", async () => {
-      const iface = IMajorityVoting__factory.createInterface();
-      expect(await voting.supportsInterface(getInterfaceID(iface))).to.be.true;
-    });
-
-    it("supports the `MajorityVotingBase` interface", async () => {
-      expect(
-        await voting.supportsInterface(
-          getInterfaceID(majorityVotingBaseInterface),
-        ),
-      ).to.be.true;
+    it("supports the `IOptimisticTokenVoting` interface", async () => {
+      const iface = IOptimisticTokenVoting__factory.createInterface();
+      expect(await plugin.supportsInterface(getInterfaceID(iface))).to.be.true;
     });
 
     it("supports the `OptimisticTokenVotingPlugin` interface", async () => {
-      const iface = getInterfaceID(TOKEN_VOTING_INTERFACE);
-      expect(iface).to.equal(TOKEN_VOTING_INTERFACE_ID); // checks that it didn't change
-      expect(await voting.supportsInterface(iface)).to.be.true;
+      const iface = getInterfaceID(optimisticTokenVotingInterface);
+      expect(iface).to.equal("0x2dc714cc"); // checks that it didn't change
+
+      expect(await plugin.supportsInterface(iface)).to.be.true;
     });
   });
 
   describe("isMember: ", async () => {
     it("returns true if the account currently owns at least one token", async () => {
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
-      await setBalances([{ receiver: signers[0].address, amount: 1 }]);
-      expect(await governanceErc20Mock.balanceOf(signers[0].address)).to.eq(1);
-      expect(await governanceErc20Mock.balanceOf(signers[1].address)).to.eq(0);
+      await setBalances([{ receiver: alice.address, amount: 1 }]);
+      expect(await governanceErc20Mock.balanceOf(alice.address)).to.eq(1);
+      expect(await governanceErc20Mock.balanceOf(bob.address)).to.eq(0);
 
-      expect(await governanceErc20Mock.getVotes(signers[0].address)).to.eq(1);
-      expect(await governanceErc20Mock.getVotes(signers[1].address)).to.eq(0);
+      expect(await governanceErc20Mock.getVotes(alice.address)).to.eq(1);
+      expect(await governanceErc20Mock.getVotes(bob.address)).to.eq(0);
 
-      expect(await voting.isMember(signers[0].address)).to.be.true;
-      expect(await voting.isMember(signers[1].address)).to.be.false;
+      expect(await plugin.isMember(alice.address)).to.be.true;
+      expect(await plugin.isMember(bob.address)).to.be.false;
     });
 
     it("returns true if the account currently has one at least one token delegated to her/him", async () => {
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
-      await setBalances([{ receiver: signers[0].address, amount: 1 }]);
-      expect(await governanceErc20Mock.balanceOf(signers[0].address)).to.eq(1);
-      expect(await governanceErc20Mock.balanceOf(signers[1].address)).to.eq(0);
+      await setBalances([{ receiver: alice.address, amount: 1 }]);
+      expect(await governanceErc20Mock.balanceOf(alice.address)).to.eq(1);
+      expect(await governanceErc20Mock.balanceOf(bob.address)).to.eq(0);
 
       await governanceErc20Mock
-        .connect(signers[0])
-        .delegate(signers[1].address);
+        .connect(alice)
+        .delegate(bob.address);
 
-      expect(await governanceErc20Mock.getVotes(signers[0].address)).to.eq(0);
-      expect(await governanceErc20Mock.getVotes(signers[1].address)).to.eq(1);
+      expect(await governanceErc20Mock.getVotes(alice.address)).to.eq(0);
+      expect(await governanceErc20Mock.getVotes(bob.address)).to.eq(1);
 
-      expect(await voting.isMember(signers[0].address)).to.be.true;
-      expect(await voting.isMember(signers[1].address)).to.be.true;
+      expect(await plugin.isMember(alice.address)).to.be.true;
+      expect(await plugin.isMember(bob.address)).to.be.true;
     });
   });
 
   describe("Proposal creation", async () => {
     beforeEach(async () => {
-      await setBalances([{ receiver: signers[0].address, amount: 1 }]);
+      await setBalances([{ receiver: alice.address, amount: 1 }]);
       await setTotalSupply(1);
     });
 
     context("minProposerVotingPower == 0", async () => {
       beforeEach(async () => {
-        votingSettings.minProposerVotingPower = 0;
-        await voting.initialize(
+        governanceSettings.minProposerVotingPower = 0;
+        await plugin.initialize(
           dao.address,
-          votingSettings,
+          governanceSettings,
           governanceErc20Mock.address,
         );
       });
 
-      it("creates a proposal if `_msgSender` owns no tokens and has not tokens delegated to her/him in the current block", async () => {
+      it("creates a proposal if `_msgSender` owns no tokens and has no tokens delegated to her/him in the current block", async () => {
         await setBalances([
           {
-            receiver: signers[1].address,
-            amount: votingSettings.minProposerVotingPower, // equals 0
+            receiver: bob.address,
+            amount: governanceSettings.minProposerVotingPower, // equals 0
           },
         ]);
 
-        const tx = await voting
-          .connect(signers[1])
+        dao.grant(plugin.address, bob.address, PROPOSER_PERMISSION_ID);
+
+        const tx = await plugin
+          .connect(bob)
           .createProposal(
             dummyMetadata,
             dummyActions,
             0,
             startDate,
             endDate,
-            VoteOption.None,
-            false,
           );
         const event = await findEvent<ProposalCreatedEvent>(
           tx,
           "ProposalCreated",
         );
-        expect(event.args.proposalId).to.equal(id);
+        expect(event!.args.proposalId).to.equal(id);
       });
     });
 
     context("minProposerVotingPower > 0", async () => {
-      beforeEach(async () => {
-        votingSettings.minProposerVotingPower = 123;
-        await voting.initialize(
+      beforeEach(() => {
+        governanceSettings.minProposerVotingPower = 123;
+
+        return plugin.initialize(
           dao.address,
-          votingSettings,
+          governanceSettings,
           governanceErc20Mock.address,
         );
       });
@@ -449,38 +325,34 @@ describe("OptimisticTokenVotingPlugin", function () {
       it("reverts if `_msgSender` owns no tokens and has no tokens delegated to her/him in the current block", async () => {
         await setBalances([
           {
-            receiver: signers[1].address,
-            amount: votingSettings.minProposerVotingPower,
+            receiver: bob.address,
+            amount: governanceSettings.minProposerVotingPower,
           },
         ]);
 
         await expect(
-          voting
-            .connect(signers[0])
+          plugin
+            .connect(alice)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         )
-          .to.be.revertedWithCustomError(voting, "ProposalCreationForbidden")
-          .withArgs(signers[0].address);
+          .to.be.revertedWithCustomError(plugin, "ProposalCreationForbidden")
+          .withArgs(alice.address);
 
         await expect(
-          voting
-            .connect(signers[1])
+          plugin
+            .connect(bob)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         ).not.to.be.reverted;
       });
@@ -488,8 +360,8 @@ describe("OptimisticTokenVotingPlugin", function () {
       it("reverts if `_msgSender` owns no tokens and has no tokens delegated to her/him in the current block although having them in the last block", async () => {
         await setBalances([
           {
-            receiver: signers[0].address,
-            amount: votingSettings.minProposerVotingPower,
+            receiver: alice.address,
+            amount: governanceSettings.minProposerVotingPower,
           },
         ]);
 
@@ -498,47 +370,46 @@ describe("OptimisticTokenVotingPlugin", function () {
           await ethers.provider.getBlock("latest")
         ).number;
 
-        // Transaction 1: Transfer the tokens from signers[0] to signers[1]
+        // Transaction 1: Transfer the tokens from alice to bob
         const tx1 = await governanceErc20Mock
-          .connect(signers[0])
-          .transfer(signers[1].address, votingSettings.minProposerVotingPower);
+          .connect(alice)
+          .transfer(
+            bob.address,
+            governanceSettings.minProposerVotingPower,
+          );
 
-        // Transaction 2: Expect the proposal creation to fail for signers[0] because he transferred the tokens in transaction 1
+        // Transaction 2: Expect the proposal creation to fail for alice because he transferred the tokens in transaction 1
         await expect(
-          voting
-            .connect(signers[0])
+          plugin
+            .connect(alice)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         )
-          .to.be.revertedWithCustomError(voting, "ProposalCreationForbidden")
-          .withArgs(signers[0].address);
+          .to.be.revertedWithCustomError(plugin, "ProposalCreationForbidden")
+          .withArgs(alice.address);
 
-        // Transaction 3: Create the proposal as signers[1]
-        const tx3 = await voting
-          .connect(signers[1])
+        // Transaction 3: Create the proposal as bob
+        const tx3 = await plugin
+          .connect(bob)
           .createProposal(
             dummyMetadata,
             [],
             0,
             startDate,
             endDate,
-            VoteOption.None,
-            false,
           );
 
         // Check the balances before the block is mined
         expect(
-          await governanceErc20Mock.balanceOf(signers[0].address),
-        ).to.equal(votingSettings.minProposerVotingPower);
+          await governanceErc20Mock.balanceOf(alice.address),
+        ).to.equal(governanceSettings.minProposerVotingPower);
         expect(
-          await governanceErc20Mock.balanceOf(signers[1].address),
+          await governanceErc20Mock.balanceOf(bob.address),
         ).to.equal(0);
 
         // Mine the block
@@ -553,22 +424,22 @@ describe("OptimisticTokenVotingPlugin", function () {
 
         // Expect the balances to have changed
         expect(
-          await governanceErc20Mock.balanceOf(signers[0].address),
+          await governanceErc20Mock.balanceOf(alice.address),
         ).to.equal(0);
         expect(
-          await governanceErc20Mock.balanceOf(signers[1].address),
-        ).to.equal(votingSettings.minProposerVotingPower);
+          await governanceErc20Mock.balanceOf(bob.address),
+        ).to.equal(governanceSettings.minProposerVotingPower);
 
         // Check the `ProposalCreatedEvent` for the creator and proposalId
         const event = await findEvent<ProposalCreatedEvent>(
           tx3,
           "ProposalCreated",
         );
-        expect(event.args.proposalId).to.equal(id);
-        expect(event.args.creator).to.equal(signers[1].address);
+        expect(event!.args.proposalId).to.equal(id);
+        expect(event!.args.creator).to.equal(bob.address);
 
         // Check that the snapshot block stored in the proposal struct
-        const proposal = await voting.getProposal(id);
+        const proposal = await plugin.getProposal(id);
         expect(proposal.parameters.snapshotBlock).to.equal(
           expectedSnapshotBlockNumber,
         );
@@ -579,40 +450,36 @@ describe("OptimisticTokenVotingPlugin", function () {
       it("creates a proposal if `_msgSender` owns enough tokens  in the current block", async () => {
         await setBalances([
           {
-            receiver: signers[0].address,
-            amount: votingSettings.minProposerVotingPower,
+            receiver: alice.address,
+            amount: governanceSettings.minProposerVotingPower,
           },
         ]);
 
-        // Check that signers[2] who has no balance and is not a delegatee can NOT create a proposal
+        // Check that charlie who has no balance and is not a delegatee can NOT create a proposal
         await expect(
-          voting
-            .connect(signers[2])
+          plugin
+            .connect(charlie)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         )
-          .to.be.revertedWithCustomError(voting, "ProposalCreationForbidden")
-          .withArgs(signers[2].address);
+          .to.be.revertedWithCustomError(plugin, "ProposalCreationForbidden")
+          .withArgs(charlie.address);
 
-        // Check that signers[0] who has enough balance can create a proposal
+        // Check that alice who has enough balance can create a proposal
         await expect(
-          voting
-            .connect(signers[0])
+          plugin
+            .connect(alice)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         ).not.to.be.reverted;
       });
@@ -620,92 +487,84 @@ describe("OptimisticTokenVotingPlugin", function () {
       it("creates a proposal if `_msgSender` owns enough tokens and has delegated them to someone else in the current block", async () => {
         await setBalances([
           {
-            receiver: signers[0].address,
-            amount: votingSettings.minProposerVotingPower,
+            receiver: alice.address,
+            amount: governanceSettings.minProposerVotingPower,
           },
         ]);
 
-        // delegate from signers[0] to signers[1]
+        // delegate from alice to bob
         await governanceErc20Mock
-          .connect(signers[0])
-          .delegate(signers[1].address);
+          .connect(alice)
+          .delegate(bob.address);
 
-        // Check that signers[2] who has a zero balance and is not a delegatee can NOT create a proposal
+        // Check that charlie who has a zero balance and is not a delegatee can NOT create a proposal
         await expect(
-          voting
-            .connect(signers[2])
+          plugin
+            .connect(charlie)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         )
-          .to.be.revertedWithCustomError(voting, "ProposalCreationForbidden")
-          .withArgs(signers[2].address);
+          .to.be.revertedWithCustomError(plugin, "ProposalCreationForbidden")
+          .withArgs(charlie.address);
 
-        const tx = await voting
-          .connect(signers[0])
+        const tx = await plugin
+          .connect(alice)
           .createProposal(
             dummyMetadata,
             dummyActions,
             0,
             startDate,
             endDate,
-            VoteOption.None,
-            false,
           );
         const event = await findEvent<ProposalCreatedEvent>(
           tx,
           "ProposalCreated",
         );
-        expect(event.args.proposalId).to.equal(id);
+        expect(event!.args.proposalId).to.equal(id);
       });
 
       it("creates a proposal if `_msgSender` owns no tokens but has enough tokens delegated to her/him in the current block", async () => {
         await setBalances([
           {
-            receiver: signers[0].address,
-            amount: votingSettings.minProposerVotingPower,
+            receiver: alice.address,
+            amount: governanceSettings.minProposerVotingPower,
           },
         ]);
 
-        // delegate from signers[0] to signers[1]
+        // delegate from alice to bob
         await governanceErc20Mock
-          .connect(signers[0])
-          .delegate(signers[1].address);
+          .connect(alice)
+          .delegate(bob.address);
 
-        // Check that signers[2] who has a zero balance and is not a delegatee can NOT create a proposal
+        // Check that charlie who has a zero balance and is not a delegatee can NOT create a proposal
         await expect(
-          voting
-            .connect(signers[2])
+          plugin
+            .connect(charlie)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         )
-          .to.be.revertedWithCustomError(voting, "ProposalCreationForbidden")
-          .withArgs(signers[2].address);
+          .to.be.revertedWithCustomError(plugin, "ProposalCreationForbidden")
+          .withArgs(charlie.address);
 
         await expect(
-          voting
-            .connect(signers[1])
+          plugin
+            .connect(bob)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         ).not.to.be.reverted;
       });
@@ -713,52 +572,48 @@ describe("OptimisticTokenVotingPlugin", function () {
       it("reverts if `_msgSender` doesn not own enough tokens herself/himself and has not tokens delegated to her/him in the current block", async () => {
         await setBalances([
           {
-            receiver: signers[0].address,
+            receiver: alice.address,
             amount: 1,
           },
           {
-            receiver: signers[1].address,
-            amount: votingSettings.minProposerVotingPower,
+            receiver: bob.address,
+            amount: governanceSettings.minProposerVotingPower,
           },
         ]);
 
-        // Check that signers[0] who has not enough tokens cannot create a proposal
+        // Check that alice who has not enough tokens cannot create a proposal
         await expect(
-          voting
-            .connect(signers[2])
+          plugin
+            .connect(charlie)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         )
-          .to.be.revertedWithCustomError(voting, "ProposalCreationForbidden")
-          .withArgs(signers[2].address);
+          .to.be.revertedWithCustomError(plugin, "ProposalCreationForbidden")
+          .withArgs(charlie.address);
 
-        // Check that signers[0] delegating to signers[1] does not let him create a proposal
+        // Check that alice delegating to bob does not let him create a proposal
         await governanceErc20Mock
-          .connect(signers[0])
-          .delegate(signers[1].address);
+          .connect(alice)
+          .delegate(bob.address);
 
         await expect(
-          voting
-            .connect(signers[0])
+          plugin
+            .connect(alice)
             .createProposal(
               dummyMetadata,
               [],
               0,
               startDate,
               endDate,
-              VoteOption.None,
-              false,
             ),
         )
-          .to.be.revertedWithCustomError(voting, "ProposalCreationForbidden")
-          .withArgs(signers[0].address);
+          .to.be.revertedWithCustomError(plugin, "ProposalCreationForbidden")
+          .withArgs(alice.address);
       });
     });
 
@@ -773,29 +628,27 @@ describe("OptimisticTokenVotingPlugin", function () {
         },
       );
 
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
       await expect(
-        voting.createProposal(
+        plugin.createProposal(
           dummyMetadata,
           [],
           0,
           0,
           0,
-          VoteOption.None,
-          false,
         ),
-      ).to.be.revertedWithCustomError(voting, "NoVotingPower");
+      ).to.be.revertedWithCustomError(plugin, "NoVotingPower");
     });
 
     it("reverts if the start date is set smaller than the current date", async () => {
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
@@ -804,17 +657,15 @@ describe("OptimisticTokenVotingPlugin", function () {
       const endDate = 0; // startDate + minDuration
 
       await expect(
-        voting.createProposal(
+        plugin.createProposal(
           dummyMetadata,
           [],
           0,
           startDateInThePast,
           endDate,
-          VoteOption.None,
-          false,
         ),
       )
-        .to.be.revertedWithCustomError(voting, "DateOutOfBounds")
+        .to.be.revertedWithCustomError(plugin, "DateOutOfBounds")
         .withArgs(
           currentDate + 1, // await takes one second
           startDateInThePast,
@@ -822,59 +673,55 @@ describe("OptimisticTokenVotingPlugin", function () {
     });
 
     it("panics if the start date is after the latest start date", async () => {
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
-      const latestStartDate = MAX_UINT64.sub(votingSettings.minDuration);
+      const latestStartDate = MAX_UINT64.sub(governanceSettings.minDuration);
       const tooLateStartDate = latestStartDate.add(1);
       const endDate = 0; // startDate + minDuration
 
       await expect(
-        voting.createProposal(
+        plugin.createProposal(
           dummyMetadata,
           [],
           0,
           tooLateStartDate,
           endDate,
-          VoteOption.None,
-          false,
         ),
       ).to.be.revertedWithPanic(0x11);
     });
 
     it("reverts if the end date is before the earliest end date so that min duration cannot be met", async () => {
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
       const startDate = (await getTime()) + 1;
-      const earliestEndDate = startDate + votingSettings.minDuration;
+      const earliestEndDate = startDate + governanceSettings.minDuration;
       const tooEarlyEndDate = earliestEndDate - 1;
 
       await expect(
-        voting.createProposal(
+        plugin.createProposal(
           dummyMetadata,
           [],
           0,
           startDate,
           tooEarlyEndDate,
-          VoteOption.None,
-          false,
         ),
       )
-        .to.be.revertedWithCustomError(voting, "DateOutOfBounds")
+        .to.be.revertedWithCustomError(plugin, "DateOutOfBounds")
         .withArgs(earliestEndDate, tooEarlyEndDate);
     });
 
     it("sets the startDate to now and endDate to startDate + minDuration, if 0 is provided as an input", async () => {
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
@@ -882,14 +729,12 @@ describe("OptimisticTokenVotingPlugin", function () {
       const startDate = 0; // now
       const endDate = 0; // startDate + minDuration
 
-      const creationTx = await voting.createProposal(
+      const creationTx = await plugin.createProposal(
         dummyMetadata,
         [],
         0,
         startDate,
         endDate,
-        VoteOption.None,
-        false,
       );
 
       const currentTime = (
@@ -897,10 +742,11 @@ describe("OptimisticTokenVotingPlugin", function () {
       ).timestamp;
 
       const expectedStartDate = currentTime;
-      const expectedEndDate = expectedStartDate + votingSettings.minDuration;
+      const expectedEndDate = expectedStartDate +
+        governanceSettings.minDuration;
 
       // Check the state
-      const proposal = await voting.getProposal(id);
+      const proposal = await plugin.getProposal(id);
       expect(proposal.parameters.startDate).to.eq(expectedStartDate);
       expect(proposal.parameters.endDate).to.eq(expectedEndDate);
 
@@ -910,140 +756,135 @@ describe("OptimisticTokenVotingPlugin", function () {
         "ProposalCreated",
       );
 
-      expect(event.args.proposalId).to.equal(id);
-      expect(event.args.creator).to.equal(signers[0].address);
-      expect(event.args.startDate).to.equal(expectedStartDate);
-      expect(event.args.endDate).to.equal(expectedEndDate);
-      expect(event.args.metadata).to.equal(dummyMetadata);
-      expect(event.args.actions).to.deep.equal([]);
-      expect(event.args.allowFailureMap).to.equal(0);
+      expect(event!.args.proposalId).to.equal(id);
+      expect(event!.args.creator).to.equal(alice.address);
+      expect(event!.args.startDate).to.equal(expectedStartDate);
+      expect(event!.args.endDate).to.equal(expectedEndDate);
+      expect(event!.args.metadata).to.equal(dummyMetadata);
+      expect(event!.args.actions).to.deep.equal([]);
+      expect(event!.args.allowFailureMap).to.equal(0);
     });
 
-    it("ceils the `minVotingPower` value if it has a remainder", async () => {
-      votingSettings.minParticipation = pctToRatio(30).add(1); // 30.0001 %
+    it("ceils the `minVetoVotingPower` value if it has a remainder", async () => {
+      governanceSettings.minVetoRatio = pctToRatio(30).add(1); // 30.0001 %
 
-      await setBalances([{ receiver: signers[0].address, amount: 10 }]);
+      await setBalances([{ receiver: alice.address, amount: 10 }]);
 
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
-      const tx = await voting.createProposal(
+      const tx = await plugin.createProposal(
         dummyMetadata,
         dummyActions,
         0,
         startDate,
         endDate,
-        VoteOption.None,
-        false,
       );
       const event = await findEvent<ProposalCreatedEvent>(
         tx,
         "ProposalCreated",
       );
-      expect(event.args.proposalId).to.equal(id);
+      expect(event!.args.proposalId).to.equal(id);
 
-      expect((await voting.getProposal(id)).parameters.minVotingPower).to.eq(4); // 4 out of 10 votes must be casted for the proposal to pass
+      expect((await plugin.getProposal(id)).parameters.minVetoVotingPower).to
+        .eq(4); // 4 out of 10 votes must be casted for the proposal to fail
     });
 
-    it("does not ceil the `minVotingPower` value if it has no remainder", async () => {
-      votingSettings.minParticipation = pctToRatio(30); // 30.0000 %
+    it("does not ceil the `minVetoVotingPower` value if it has no remainder", async () => {
+      governanceSettings.minVetoRatio = pctToRatio(30); // 30.0000 %
 
-      await setBalances([{ receiver: signers[0].address, amount: 10 }]); // 10 votes * 30% = 3 votes
+      await setBalances([{ receiver: alice.address, amount: 10 }]); // 10 votes * 30% = 3 votes
 
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
-      const tx = await voting.createProposal(
+      const tx = await plugin.createProposal(
         dummyMetadata,
         dummyActions,
         0,
         startDate,
         endDate,
-        VoteOption.None,
-        false,
       );
       const event = await findEvent<ProposalCreatedEvent>(
         tx,
         "ProposalCreated",
       );
-      expect(event.args.proposalId).to.equal(id);
+      expect(event!.args.proposalId).to.equal(id);
 
-      expect((await voting.getProposal(id)).parameters.minVotingPower).to.eq(3); // 3 out of 10 votes must be casted for the proposal to pass
+      expect((await plugin.getProposal(id)).parameters.minVetoVotingPower).to
+        .eq(3); // 3 out of 10 votes must be casted for the proposal to fail
     });
 
-    it("should create a vote successfully, but not vote", async () => {
-      await voting.initialize(
+    it("should create a vote successfully", async () => {
+      governanceSettings = {
+        minVetoRatio: pctToRatio(15), // 15%
+        minDuration: ONE_WEEK,
+        minProposerVotingPower: 0,
+      };
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
 
       const allowFailureMap = 1;
 
-      await setBalances([{ receiver: signers[0].address, amount: 10 }]);
+      await setBalances([{ receiver: alice.address, amount: 10 }]);
 
-      let tx = await voting.createProposal(
+      let tx = await plugin.createProposal(
         dummyMetadata,
         dummyActions,
         allowFailureMap,
         0,
         0,
-        VoteOption.None,
-        false,
       );
 
       await expect(tx)
-        .to.emit(voting, PROPOSAL_EVENTS.PROPOSAL_CREATED)
-        .to.not.emit(voting, VOTING_EVENTS.VOTE_CAST);
+        .to.emit(plugin, "ProposalCreated");
 
       const event = await findEvent<ProposalCreatedEvent>(
         tx,
-        PROPOSAL_EVENTS.PROPOSAL_CREATED,
+        "ProposalCreated",
       );
-      expect(event.args.proposalId).to.equal(id);
-      expect(event.args.creator).to.equal(signers[0].address);
-      expect(event.args.metadata).to.equal(dummyMetadata);
-      expect(event.args.actions.length).to.equal(1);
-      expect(event.args.actions[0].to).to.equal(dummyActions[0].to);
-      expect(event.args.actions[0].value).to.equal(dummyActions[0].value);
-      expect(event.args.actions[0].data).to.equal(dummyActions[0].data);
-      expect(event.args.allowFailureMap).to.equal(allowFailureMap);
+      expect(event!.args.proposalId).to.equal(id);
+      expect(event!.args.creator).to.equal(alice.address);
+      expect(event!.args.metadata).to.equal(dummyMetadata);
+      expect(event!.args.actions.length).to.equal(1);
+      expect(event!.args.actions[0].to).to.equal(dummyActions[0].to);
+      expect(event!.args.actions[0].value).to.equal(dummyActions[0].value);
+      expect(event!.args.actions[0].data).to.equal(dummyActions[0].data);
+      expect(event!.args.allowFailureMap).to.equal(allowFailureMap);
 
       const block = await ethers.provider.getBlock("latest");
 
-      const proposal = await voting.getProposal(id);
+      const proposal = await plugin.getProposal(id);
 
       expect(proposal.open).to.equal(true);
       expect(proposal.executed).to.equal(false);
       expect(proposal.allowFailureMap).to.equal(allowFailureMap);
-      expect(proposal.parameters.supportThreshold).to.equal(
-        votingSettings.supportThreshold,
-      );
 
-      expect(proposal.parameters.minVotingPower).to.equal(
-        (await voting.totalVotingPower(proposal.parameters.snapshotBlock))
-          .mul(votingSettings.minParticipation)
-          .div(pctToRatio(100)),
-      );
+      expect(proposal.parameters.minVetoVotingPower).to.equal(2); // 15% of 10 tokens ceiled => 2
       expect(proposal.parameters.snapshotBlock).to.equal(block.number - 1);
       expect(
-        proposal.parameters.startDate.add(votingSettings.minDuration),
+        proposal.parameters.startDate.add(governanceSettings.minDuration),
       ).to.equal(proposal.parameters.endDate);
 
       expect(
-        await voting.totalVotingPower(proposal.parameters.snapshotBlock),
+        await plugin.totalVotingPower(proposal.parameters.snapshotBlock),
       ).to.equal(10);
-      expect(proposal.tally.yes).to.equal(0);
-      expect(proposal.tally.no).to.equal(0);
+      expect(proposal.vetoTally).to.equal(0);
 
       expect(
-        await voting.canVote(1, signers[0].address, VoteOption.Yes),
+        await plugin.canVeto(id, alice.address),
+      ).to.equal(true);
+      expect(
+        await plugin.canVeto(id + 1, alice.address),
       ).to.equal(false);
 
       expect(proposal.actions.length).to.equal(1);
@@ -1051,629 +892,35 @@ describe("OptimisticTokenVotingPlugin", function () {
       expect(proposal.actions[0].value).to.equal(dummyActions[0].value);
       expect(proposal.actions[0].data).to.equal(dummyActions[0].data);
     });
-
-    it("should create a vote and cast a vote immediately", async () => {
-      await voting.initialize(
-        dao.address,
-        votingSettings,
-        governanceErc20Mock.address,
-      );
-
-      await setBalances([{ receiver: signers[0].address, amount: 10 }]);
-
-      let tx = await voting.createProposal(
-        dummyMetadata,
-        dummyActions,
-        0,
-        0,
-        0,
-        VoteOption.Yes,
-        false,
-      );
-
-      await expect(tx)
-        .to.emit(voting, PROPOSAL_EVENTS.PROPOSAL_CREATED)
-        .to.emit(voting, VOTING_EVENTS.VOTE_CAST)
-        .withArgs(id, signers[0].address, VoteOption.Yes, 10);
-
-      const event = await findEvent<ProposalCreatedEvent>(
-        tx,
-        PROPOSAL_EVENTS.PROPOSAL_CREATED,
-      );
-      expect(event.args.proposalId).to.equal(id);
-      expect(event.args.creator).to.equal(signers[0].address);
-      expect(event.args.metadata).to.equal(dummyMetadata);
-      expect(event.args.actions.length).to.equal(1);
-      expect(event.args.actions[0].to).to.equal(dummyActions[0].to);
-      expect(event.args.actions[0].value).to.equal(dummyActions[0].value);
-      expect(event.args.actions[0].data).to.equal(dummyActions[0].data);
-      expect(event.args.allowFailureMap).to.equal(0);
-
-      const block = await ethers.provider.getBlock("latest");
-
-      const proposal = await voting.getProposal(id);
-      expect(proposal.open).to.equal(true);
-      expect(proposal.executed).to.equal(false);
-      expect(proposal.allowFailureMap).to.equal(0);
-      expect(proposal.parameters.supportThreshold).to.equal(
-        votingSettings.supportThreshold,
-      );
-      expect(proposal.parameters.minVotingPower).to.equal(
-        (await voting.totalVotingPower(proposal.parameters.snapshotBlock))
-          .mul(votingSettings.minParticipation)
-          .div(pctToRatio(100)),
-      );
-      expect(proposal.parameters.snapshotBlock).to.equal(block.number - 1);
-
-      expect(
-        await voting.totalVotingPower(proposal.parameters.snapshotBlock),
-      ).to.equal(10);
-      expect(proposal.tally.yes).to.equal(10);
-      expect(proposal.tally.no).to.equal(0);
-      expect(proposal.tally.abstain).to.equal(0);
-    });
-
-    it("reverts creation when voting before the start date", async () => {
-      await voting.initialize(
-        dao.address,
-        votingSettings,
-        governanceErc20Mock.address,
-      );
-
-      expect(await getTime()).to.be.lessThan(startDate);
-
-      // Reverts if the vote option is not 'None'
-      await expect(
-        voting.createProposal(
-          dummyMetadata,
-          dummyActions,
-          0,
-          startDate,
-          endDate,
-          VoteOption.Yes,
-          false,
-        ),
-      )
-        .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-        .withArgs(id, signers[0].address, VoteOption.Yes);
-
-      // Works if the vote option is 'None'
-      const tx = await voting.createProposal(
-        dummyMetadata,
-        dummyActions,
-        0,
-        startDate,
-        endDate,
-        VoteOption.None,
-        false,
-      );
-      const event = await findEvent<ProposalCreatedEvent>(
-        tx,
-        "ProposalCreated",
-      );
-      expect(event.args.proposalId).to.equal(id);
-    });
   });
 
-  describe("Proposal + Execute:", async () => {
-    beforeEach(async () => {
-      const receivers = signers.slice(0, 12).map((s) => s.address);
-      const amounts = Array(9).fill(10).concat([5, 4, 1]);
+  describe("Different scenarios:", async () => {
+    it("Should revert if minVetoRatio is zero", async () => {
+      governanceSettings.minVetoRatio = pctToRatio(0);
 
-      const balances = receivers.map((receiver, i) => {
-        return {
-          receiver: receiver,
-          amount: amounts[i],
-        };
-      });
+      await expect(plugin.initialize(
+        dao.address,
+        governanceSettings,
+        governanceErc20Mock.address,
+      )).to.revertedWithCustomError(plugin, "RatioOutOfBounds");
+    });
+    it("Should revert if minVetoRatio > 100%", async () => {
+      governanceSettings.minVetoRatio = pctToRatio(101);
 
-      await setBalances(balances);
-      await setTotalSupply(100);
+      await expect(plugin.initialize(
+        dao.address,
+        governanceSettings,
+        governanceErc20Mock.address,
+      )).to.revertedWithCustomError(plugin, "RatioOutOfBounds");
     });
 
-    context("Standard Mode", async () => {
+    describe("minVetoRatio is 5%", async () => {
       beforeEach(async () => {
-        votingSettings.votingMode = VotingMode.Standard;
+        governanceSettings.minVetoRatio = pctToRatio(15);
 
-        await voting.initialize(
+        await plugin.initialize(
           dao.address,
-          votingSettings,
-          governanceErc20Mock.address,
-        );
-
-        const tx = await voting.createProposal(
-          dummyMetadata,
-          dummyActions,
-          0,
-          startDate,
-          endDate,
-          VoteOption.None,
-          false,
-        );
-        const event = await findEvent<ProposalCreatedEvent>(
-          tx,
-          "ProposalCreated",
-        );
-        expect(event.args.proposalId).to.equal(id);
-      });
-
-      it("reverts on voting None", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        // Check that voting is possible but don't vote using `callStatic`
-        await expect(voting.callStatic.vote(id, VoteOption.Yes, false)).not.to
-          .be.reverted;
-
-        await expect(voting.vote(id, VoteOption.None, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.None);
-      });
-
-      it("reverts on vote replacement", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voting.vote(id, VoteOption.Yes, false);
-
-        // Try to replace the vote
-        await expect(voting.vote(id, VoteOption.Yes, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.Yes);
-        await expect(voting.vote(id, VoteOption.No, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.No);
-        await expect(voting.vote(id, VoteOption.Abstain, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.Abstain);
-        await expect(voting.vote(id, VoteOption.None, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.None);
-      });
-
-      it("cannot early execute", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2, 3, 4, 5], // 60 votes
-          no: [],
-          abstain: [],
-        });
-
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(false);
-      });
-
-      it("can execute normally if participation and support are met", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2], // 30 votes
-          no: [3, 4], // 20 votes
-          abstain: [5, 6], // 20 votes
-        });
-
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        await advanceAfterVoteEnd(endDate);
-
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-
-        expect(await voting.canExecute(id)).to.equal(true);
-      });
-
-      it("does not execute early when voting with the `tryEarlyExecution` option", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2, 3], // 40 votes
-          no: [],
-          abstain: [],
-        });
-
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        // `tryEarlyExecution` is turned on but the vote is not decided yet
-        await voting.connect(signers[4]).vote(id, VoteOption.Yes, true);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        // `tryEarlyExecution` is turned off and the vote is decided
-        await voting.connect(signers[5]).vote(id, VoteOption.Yes, false);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        // `tryEarlyExecution` is turned on and the vote is decided
-        await voting.connect(signers[6]).vote(id, VoteOption.Yes, true);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false);
-      });
-
-      it("reverts if vote is not decided yet", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await expect(voting.execute(id))
-          .to.be.revertedWithCustomError(voting, "ProposalExecutionForbidden")
-          .withArgs(id);
-      });
-    });
-    context("Early Execution", async () => {
-      beforeEach(async () => {
-        votingSettings.votingMode = VotingMode.EarlyExecution;
-
-        await voting.initialize(
-          dao.address,
-          votingSettings,
-          governanceErc20Mock.address,
-        );
-
-        const tx = await voting.createProposal(
-          dummyMetadata,
-          dummyActions,
-          0,
-          startDate,
-          endDate,
-          VoteOption.None,
-          false,
-        );
-        const event = await findEvent<ProposalCreatedEvent>(
-          tx,
-          "ProposalCreated",
-        );
-        expect(event.args.proposalId).to.equal(id);
-      });
-
-      it("does not allow voting, when the vote has not started yet", async () => {
-        expect(await getTime()).to.be.lessThan(startDate);
-
-        await expect(voting.vote(id, VoteOption.Yes, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.Yes);
-      });
-
-      it("should not be able to vote if user has 0 token", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await expect(
-          voting.connect(signers[19]).vote(id, VoteOption.Yes, false),
-        )
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[19].address, VoteOption.Yes);
-      });
-
-      it("increases the yes, no, and abstain count and emits correct events", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await expect(voting.connect(signers[0]).vote(id, VoteOption.Yes, false))
-          .to.emit(voting, VOTING_EVENTS.VOTE_CAST)
-          .withArgs(id, signers[0].address, VoteOption.Yes, 10);
-
-        let proposal = await voting.getProposal(id);
-        expect(proposal.tally.yes).to.equal(10);
-        expect(proposal.tally.yes).to.equal(10);
-        expect(proposal.tally.no).to.equal(0);
-        expect(proposal.tally.abstain).to.equal(0);
-
-        await expect(voting.connect(signers[1]).vote(id, VoteOption.No, false))
-          .to.emit(voting, VOTING_EVENTS.VOTE_CAST)
-          .withArgs(id, signers[1].address, VoteOption.No, 10);
-
-        proposal = await voting.getProposal(id);
-        expect(proposal.tally.no).to.equal(10);
-        expect(proposal.tally.no).to.equal(10);
-        expect(proposal.tally.abstain).to.equal(0);
-
-        await expect(
-          voting.connect(signers[2]).vote(id, VoteOption.Abstain, false),
-        )
-          .to.emit(voting, VOTING_EVENTS.VOTE_CAST)
-          .withArgs(id, signers[2].address, VoteOption.Abstain, 10);
-
-        proposal = await voting.getProposal(id);
-        expect(proposal.tally.yes).to.equal(10);
-        expect(proposal.tally.no).to.equal(10);
-        expect(proposal.tally.abstain).to.equal(10);
-      });
-
-      it("reverts on voting None", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        // Check that voting is possible but don't vote using `callStatic`
-        await expect(voting.callStatic.vote(id, VoteOption.Yes, false)).not.to
-          .be.reverted;
-
-        await expect(voting.vote(id, VoteOption.None, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.None);
-      });
-
-      it("reverts on vote replacement", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voting.vote(id, VoteOption.Yes, false);
-
-        // Try to replace the vote
-        await expect(voting.vote(id, VoteOption.Yes, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.Yes);
-        await expect(voting.vote(id, VoteOption.No, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.No);
-        await expect(voting.vote(id, VoteOption.Abstain, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.Abstain);
-        await expect(voting.vote(id, VoteOption.None, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.None);
-      });
-
-      it("can execute early if participation is large enough", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2, 3, 4], // 50 votes
-          no: [],
-          abstain: [],
-        });
-
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        await voting.connect(signers[5]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(true);
-
-        await advanceAfterVoteEnd(endDate);
-
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(true);
-      });
-
-      it("can execute normally if participation is large enough", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2, 3, 4], // 50 yes
-          no: [5, 6, 7], // 30 votes
-          abstain: [8], // 10 votes
-        });
-
-        // closes the vote
-        await advanceAfterVoteEnd(endDate);
-
-        //The vote is executable as support > 50%, participation > 20%, and the voting period is over
-        expect(await voting.canExecute(id)).to.equal(true);
-      });
-
-      it("cannot execute normally if participation is too low", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0], // 10 votes
-          no: [9], //  5 votes
-          abstain: [10], // 4 votes
-        });
-
-        // closes the vote
-        await advanceAfterVoteEnd(endDate);
-
-        //The vote is not executable because the participation with 19% is still too low, despite a support of 67% and the voting period being over
-        expect(await voting.canExecute(id)).to.equal(false);
-      });
-
-      it("executes the vote immediately when the vote is decided early and the tryEarlyExecution options is selected", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2, 3], // 40 votes
-          no: [], // 0 votes
-          abstain: [], // 0 votes
-        });
-
-        // `tryEarlyExecution` is turned on but the vote is not decided yet
-        await voting.connect(signers[4]).vote(id, VoteOption.Yes, true);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        // `tryEarlyExecution` is turned off and the vote is decided
-        await voting.connect(signers[5]).vote(id, VoteOption.Yes, false);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(true);
-
-        // `tryEarlyExecution` is turned on and the vote is decided
-        let tx = await voting
-          .connect(signers[6])
-          .vote(id, VoteOption.Yes, true);
-        {
-          const event = await findEventTopicLog<ExecutedEvent>(
-            tx,
-            DAO__factory.createInterface(),
-            DAO_EVENTS.EXECUTED,
-          );
-
-          expect(event.args.actor).to.equal(voting.address);
-          expect(event.args.callId).to.equal(toBytes32(id));
-          expect(event.args.actions.length).to.equal(1);
-          expect(event.args.actions[0].to).to.equal(dummyActions[0].to);
-          expect(event.args.actions[0].value).to.equal(dummyActions[0].value);
-          expect(event.args.actions[0].data).to.equal(dummyActions[0].data);
-          expect(event.args.execResults).to.deep.equal(["0x"]);
-
-          expect((await voting.getProposal(id)).executed).to.equal(true);
-        }
-
-        // check for the `ProposalExecuted` event in the voting contract
-        {
-          const event = await findEvent<ProposalExecutedEvent>(
-            tx,
-            PROPOSAL_EVENTS.PROPOSAL_EXECUTED,
-          );
-          expect(event.args.proposalId).to.equal(id);
-        }
-
-        // calling execute again should fail
-        await expect(voting.execute(id))
-          .to.be.revertedWithCustomError(voting, "ProposalExecutionForbidden")
-          .withArgs(id);
-      });
-
-      it("reverts if vote is not decided yet", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await expect(voting.execute(id))
-          .to.be.revertedWithCustomError(voting, "ProposalExecutionForbidden")
-          .withArgs(id);
-      });
-    });
-
-    context("Vote Replacement", async () => {
-      beforeEach(async () => {
-        votingSettings.votingMode = VotingMode.VoteReplacement;
-
-        await voting.initialize(
-          dao.address,
-          votingSettings,
-          governanceErc20Mock.address,
-        );
-
-        const tx = await voting.createProposal(
-          dummyMetadata,
-          dummyActions,
-          0,
-          startDate,
-          endDate,
-          VoteOption.None,
-          false,
-        );
-        const event = await findEvent<ProposalCreatedEvent>(
-          tx,
-          "ProposalCreated",
-        );
-        expect(event.args.proposalId).to.equal(id);
-      });
-
-      it("reverts on voting None", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        // Check that voting is possible but don't vote using `callStatic`
-        await expect(voting.callStatic.vote(id, VoteOption.Yes, false)).not.to
-          .be.reverted;
-
-        await expect(voting.vote(id, VoteOption.None, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.None);
-      });
-
-      it("should allow vote replacement but not double-count votes by the same address", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voting.vote(id, VoteOption.Yes, false);
-        await voting.vote(id, VoteOption.Yes, false);
-        expect((await voting.getProposal(id)).tally.yes).to.equal(10);
-        expect((await voting.getProposal(id)).tally.no).to.equal(0);
-        expect((await voting.getProposal(id)).tally.abstain).to.equal(0);
-
-        await voting.vote(id, VoteOption.No, false);
-        await voting.vote(id, VoteOption.No, false);
-        expect((await voting.getProposal(id)).tally.yes).to.equal(0);
-        expect((await voting.getProposal(id)).tally.no).to.equal(10);
-        expect((await voting.getProposal(id)).tally.abstain).to.equal(0);
-
-        await voting.vote(id, VoteOption.Abstain, false);
-        await voting.vote(id, VoteOption.Abstain, false);
-        expect((await voting.getProposal(id)).tally.yes).to.equal(0);
-        expect((await voting.getProposal(id)).tally.no).to.equal(0);
-        expect((await voting.getProposal(id)).tally.abstain).to.equal(10);
-
-        await expect(voting.vote(id, VoteOption.None, false))
-          .to.be.revertedWithCustomError(voting, "VoteCastForbidden")
-          .withArgs(id, signers[0].address, VoteOption.None);
-      });
-
-      it("cannot early execute", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2, 3, 4, 5], // 60 votes
-          no: [],
-          abstain: [],
-        });
-
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(false);
-      });
-
-      it("can execute normally if participation and support are met", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2], // 30 votes
-          no: [3, 4], // 20 votes
-          abstain: [5, 6], // 20 votes
-        });
-
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        await advanceAfterVoteEnd(endDate);
-
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-
-        expect(await voting.canExecute(id)).to.equal(true);
-      });
-
-      it("does not execute early when voting with the `tryEarlyExecution` option", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await voteWithSigners(voting, id, signers, {
-          yes: [0, 1, 2, 3], // 40 votes
-          no: [], // 0 votes
-          abstain: [], // 0 votes
-        });
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false); //
-
-        // `tryEarlyExecution` is turned on but the vote is not decided yet
-        await voting.connect(signers[4]).vote(id, VoteOption.Yes, true);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        // `tryEarlyExecution` is turned off and the vote is decided
-        await voting.connect(signers[5]).vote(id, VoteOption.Yes, false);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        //// `tryEarlyExecution` is turned on and the vote is decided
-        await voting.connect(signers[6]).vote(id, VoteOption.Yes, true);
-        expect((await voting.getProposal(id)).executed).to.equal(false);
-        expect(await voting.canExecute(id)).to.equal(false);
-      });
-
-      it("reverts if vote is not decided yet", async () => {
-        await advanceIntoVoteTime(startDate, endDate);
-
-        await expect(voting.execute(id))
-          .to.be.revertedWithCustomError(voting, "ProposalExecutionForbidden")
-          .withArgs(id);
-      });
-    });
-  });
-
-  describe("Different configurations:", async () => {
-    describe("A simple majority vote with >50% support and >=25% participation required", async () => {
-      beforeEach(async () => {
-        votingSettings.minParticipation = pctToRatio(25);
-
-        await voting.initialize(
-          dao.address,
-          votingSettings,
+          governanceSettings,
           governanceErc20Mock.address,
         );
 
@@ -1681,178 +928,191 @@ describe("OptimisticTokenVotingPlugin", function () {
           (i) => signers[i].address,
         );
         const amounts = Array(10).fill(10);
-        const balances = receivers.map((receiver, i) => {
-          return {
-            receiver: receiver,
-            amount: amounts[i],
-          };
-        });
+        const balances = receivers.map((receiver, i) => ({
+          receiver: receiver,
+          amount: amounts[i],
+        }));
 
         await setBalances(balances);
         await setTotalSupply(100);
 
-        await voting.createProposal(
+        await plugin.createProposal(
           dummyMetadata,
           dummyActions,
           0,
           0,
           0,
-          VoteOption.None,
-          false,
         );
       });
 
-      it("does not execute if support is high enough but participation is too low", async () => {
-        advanceIntoVoteTime(startDate, endDate);
-
-        await voting.connect(signers[0]).vote(id, VoteOption.Yes, false);
-
-        expect(await voting.isMinParticipationReached(id)).to.be.false;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-
-        expect(await voting.canExecute(id)).to.equal(false);
+      it("executes if nobody vetoes", async () => {
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
 
         await advanceAfterVoteEnd(endDate);
 
-        expect(await voting.isMinParticipationReached(id)).to.be.false;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(true);
+
+        await expect(plugin.execute(id)).to.not.be.reverted;
+      });
+
+      it("executes if not enough voters veto", async () => {
+        await plugin.connect(signers[0]).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
+
+        await advanceAfterVoteEnd(endDate);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(true);
+      });
+
+      it("does not execute if enough voters veto", async () => {
+        await plugin.connect(signers[0]).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
+
+        await plugin.connect(signers[1]).veto(id);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.equal(false);
+
+        await advanceAfterVoteEnd(endDate);
+
+        expect(await plugin.isMinVetoRatioReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(true);
+      });
+
+      it("does not execute if support is high enough but participation is too low", async () => {
+        await advanceIntoVoteTime(startDate, endDate);
+
+        await plugin.connect(alice).veto(id);
+
+        expect(await plugin.isMinParticipationReached(id)).to.be.false;
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
+
+        expect(await plugin.canExecute(id)).to.equal(false);
+
+        await advanceAfterVoteEnd(endDate);
+
+        expect(await plugin.isMinParticipationReached(id)).to.be.false;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.equal(false);
       });
 
       it("does not execute if participation is high enough but support is too low", async () => {
         await advanceIntoVoteTime(startDate, endDate);
 
-        await voteWithSigners(voting, id, signers, {
+        await voteWithSigners(plugin, id, signers, {
           yes: [0], // 10 votes
           no: [1, 2], //  20 votes
           abstain: [], // 0 votes
         });
 
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
 
         await advanceAfterVoteEnd(endDate);
 
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.false;
-        expect(await voting.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
       });
 
       it("executes after the duration if participation and support are met", async () => {
         await advanceIntoVoteTime(startDate, endDate);
 
-        await voteWithSigners(voting, id, signers, {
+        await voteWithSigners(plugin, id, signers, {
           yes: [0, 1, 2], // 30 votes
           no: [], //  0 votes
           abstain: [], // 0 votes
         });
 
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
 
         await advanceAfterVoteEnd(endDate);
 
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(true);
-      });
-
-      it("executes early if participation and support are met and the vote outcome cannot change anymore", async () => {
-        const promises = [0, 1, 2, 3, 4].map((i) =>
-          voting.connect(signers[i]).vote(id, VoteOption.Yes, false)
-        );
-        await Promise.all(promises);
-
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.canExecute(id)).to.equal(false);
-
-        await voting.connect(signers[5]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(true);
-
-        await advanceAfterVoteEnd(endDate);
-
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(true);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.equal(true);
       });
     });
 
     describe("An edge case with `supportThreshold = 0%`, `minParticipation = 0%`, in early execution mode", async () => {
       beforeEach(async () => {
-        votingSettings.supportThreshold = pctToRatio(0);
-        votingSettings.minParticipation = pctToRatio(0);
-        votingSettings.votingMode = VotingMode.EarlyExecution;
+        governanceSettings.supportThreshold = pctToRatio(0);
+        governanceSettings.minParticipation = pctToRatio(0);
+        governanceSettings.votingMode = VotingMode.EarlyExecution;
 
-        await voting.initialize(
+        await plugin.initialize(
           dao.address,
-          votingSettings,
+          governanceSettings,
           governanceErc20Mock.address,
         );
 
-        await setBalances([{ receiver: signers[0].address, amount: 1 }]);
+        await setBalances([{ receiver: alice.address, amount: 1 }]);
         await setTotalSupply(100);
 
-        await voting.createProposal(
+        await plugin.createProposal(
           dummyMetadata,
           dummyActions,
           0,
           0,
           0,
-          VoteOption.None,
-          false,
         );
       });
 
       it("does not execute with 0 votes", async () => {
         // does not execute early
-        advanceIntoVoteTime(startDate, endDate);
+        await advanceIntoVoteTime(startDate, endDate);
 
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
 
         // does not execute normally
         await advanceAfterVoteEnd(endDate);
 
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.false;
-        expect(await voting.canExecute(id)).to.equal(false);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.false;
+        expect(await plugin.canExecute(id)).to.equal(false);
       });
 
       it("executes if participation and support are met", async () => {
         await advanceIntoVoteTime(startDate, endDate);
 
-        await voting.connect(signers[0]).vote(id, VoteOption.Yes, false);
+        await plugin.connect(alice).veto(id);
 
         // Check if the proposal can execute early
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(true);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.equal(true);
 
         // Check if the proposal can execute normally
         await advanceAfterVoteEnd(endDate);
 
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.equal(true);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.equal(true);
       });
     });
   });
 
   describe("An edge case with `supportThreshold = 99.9999%` and `minParticipation = 100%` in early execution mode", async () => {
     beforeEach(async () => {
-      votingSettings.supportThreshold = pctToRatio(100).sub(1);
-      votingSettings.minParticipation = pctToRatio(100);
-      votingSettings.votingMode = VotingMode.EarlyExecution;
+      governanceSettings.supportThreshold = pctToRatio(100).sub(1);
+      governanceSettings.minParticipation = pctToRatio(100);
+      governanceSettings.votingMode = VotingMode.EarlyExecution;
 
-      await voting.initialize(
+      await plugin.initialize(
         dao.address,
-        votingSettings,
+        governanceSettings,
         governanceErc20Mock.address,
       );
     });
@@ -1863,36 +1123,34 @@ describe("OptimisticTokenVotingPlugin", function () {
         const delta = totalSupply.div(RATIO_BASE);
         await setBalances([
           {
-            receiver: signers[0].address,
+            receiver: alice.address,
             amount: totalSupply.sub(delta), // 99.9999% of the total supply
           },
-          { receiver: signers[1].address, amount: 1 }, // 1 vote (10^-16 % = 0.0000000000000001%)
-          { receiver: signers[2].address, amount: delta.sub(1) }, // 1 vote less than 0.0001% of the total supply (99.9999% - 10^-16% = 0.00009999999999999%)
+          { receiver: bob.address, amount: 1 }, // 1 vote (10^-16 % = 0.0000000000000001%)
+          { receiver: charlie.address, amount: delta.sub(1) }, // 1 vote less than 0.0001% of the total supply (99.9999% - 10^-16% = 0.00009999999999999%)
         ]);
 
-        await voting.createProposal(
+        await plugin.createProposal(
           dummyMetadata,
           dummyActions,
           0,
           0,
           0,
-          VoteOption.None,
-          false,
         );
       });
 
       it("early support criterium is sharp by 1 vote", async () => {
-        advanceIntoVoteTime(startDate, endDate);
+        await advanceIntoVoteTime(startDate, endDate);
 
-        // 99.9999% of the voting power voted for yes
-        await voting.connect(signers[0]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
+        // 99.9999% of the plugin power voted for yes
+        await plugin.connect(alice).veto(id);
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
 
         // 1 vote is still missing to meet >99.9999% worst case support
-        const proposal = await voting.getProposal(id);
+        const proposal = await plugin.getProposal(id);
         const tally = proposal.tally;
-        const totalVotingPower = await voting.totalVotingPower(
+        const totalVotingPower = await plugin.totalVotingPower(
           proposal.parameters.snapshotBlock,
         );
         expect(
@@ -1900,36 +1158,36 @@ describe("OptimisticTokenVotingPlugin", function () {
         ).to.eq(totalVotingPower.div(RATIO_BASE));
 
         // vote with 1 more yes vote
-        await voting.connect(signers[1]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
+        await plugin.connect(bob).veto(id);
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
 
-        // voting with the remaining votes does not change this
-        await voting.connect(signers[2]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
+        // plugin with the remaining votes does not change this
+        await plugin.connect(charlie).veto(id);
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
       });
 
       it("participation criterium is sharp by 1 vote", async () => {
         await advanceIntoVoteTime(startDate, endDate);
 
-        await voting.connect(signers[0]).vote(id, VoteOption.Yes, false);
-        await voting.connect(signers[2]).vote(id, VoteOption.Yes, false);
+        await plugin.connect(alice).veto(id);
+        await plugin.connect(charlie).veto(id);
 
         // 1 vote is still missing to meet particpiation = 100%
-        const proposal = await voting.getProposal(id);
+        const proposal = await plugin.getProposal(id);
         const tally = proposal.tally;
-        const totalVotingPower = await voting.totalVotingPower(
+        const totalVotingPower = await plugin.totalVotingPower(
           proposal.parameters.snapshotBlock,
         );
         expect(
           totalVotingPower.sub(tally.yes).sub(tally.no).sub(tally.abstain),
         ).to.eq(1);
-        expect(await voting.isMinParticipationReached(id)).to.be.false;
+        expect(await plugin.isMinParticipationReached(id)).to.be.false;
 
         // cast the last vote so that participation = 100%
-        await voting.connect(signers[1]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
+        await plugin.connect(bob).veto(id);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
       });
     });
 
@@ -1939,83 +1197,79 @@ describe("OptimisticTokenVotingPlugin", function () {
 
       beforeEach(async () => {
         await setBalances([
-          { receiver: signers[0].address, amount: totalSupply.sub(delta) }, // 99.9999%
-          { receiver: signers[1].address, amount: delta }, //             0.0001%
+          { receiver: alice.address, amount: totalSupply.sub(delta) }, // 99.9999%
+          { receiver: bob.address, amount: delta }, //             0.0001%
         ]);
 
-        await voting.createProposal(
+        await plugin.createProposal(
           dummyMetadata,
           dummyActions,
           0,
           0,
           0,
-          VoteOption.None,
-          false,
         );
       });
 
       it("early support criterium is sharp by 1 vote", async () => {
-        advanceIntoVoteTime(startDate, endDate);
+        await advanceIntoVoteTime(startDate, endDate);
 
-        await voting.connect(signers[0]).vote(id, VoteOption.Yes, false);
+        await plugin.connect(alice).veto(id);
 
         // 1 vote is still missing to meet >99.9999%
-        const proposal = await voting.getProposal(id);
+        const proposal = await plugin.getProposal(id);
         const tally = proposal.tally;
-        const totalVotingPower = await voting.totalVotingPower(
+        const totalVotingPower = await plugin.totalVotingPower(
           proposal.parameters.snapshotBlock,
         );
         expect(
           totalVotingPower.sub(tally.yes).sub(tally.abstain), // this is the number of worst case no votes
         ).to.eq(totalVotingPower.div(RATIO_BASE));
 
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.false;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.false;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
 
         // cast the last vote so that support = 100%
-        await voting.connect(signers[1]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
+        await plugin.connect(bob).veto(id);
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
       });
 
       it("participation is not met with 1 vote missing", async () => {
         await advanceIntoVoteTime(startDate, endDate);
 
-        await voting.connect(signers[0]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isMinParticipationReached(id)).to.be.false;
+        await plugin.connect(alice).veto(id);
+        expect(await plugin.isMinParticipationReached(id)).to.be.false;
 
         // 1 vote is still missing to meet particpiation = 100%
-        const proposal = await voting.getProposal(id);
+        const proposal = await plugin.getProposal(id);
         const tally = proposal.tally;
-        const totalVotingPower = await voting.totalVotingPower(
+        const totalVotingPower = await plugin.totalVotingPower(
           proposal.parameters.snapshotBlock,
         );
         expect(
           totalVotingPower.sub(tally.yes).sub(tally.no).sub(tally.abstain),
         ).to.eq(1);
-        expect(await voting.isMinParticipationReached(id)).to.be.false;
+        expect(await plugin.isMinParticipationReached(id)).to.be.false;
 
         // cast the last vote so that participation = 100%
-        await voting.connect(signers[1]).vote(id, VoteOption.Yes, false);
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
+        await plugin.connect(bob).veto(id);
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
       });
     });
   });
 
   describe("Execution criteria handle token balances for multiple orders of magnitude", async function () {
     beforeEach(async () => {
-      votingSettings.supportThreshold = pctToRatio(50);
-      votingSettings.minParticipation = pctToRatio(20);
-      votingSettings.votingMode = VotingMode.EarlyExecution;
+      governanceSettings.minVetoRatio = pctToRatio(20);
     });
 
     const powers = [0, 1, 2, 3, 6, 12, 18, 24, 36, 48];
 
     powers.forEach(async (power) => {
       it(`magnitudes of 10^${power}`, async function () {
-        await voting.initialize(
+        await plugin.initialize(
           dao.address,
-          votingSettings,
+          governanceSettings,
           governanceErc20Mock.address,
         );
 
@@ -2024,46 +1278,44 @@ describe("OptimisticTokenVotingPlugin", function () {
         const oneToken = magnitude;
         const balances = [
           {
-            receiver: signers[0].address,
+            receiver: alice.address,
             amount: oneToken.mul(5).add(1),
           },
           {
-            receiver: signers[1].address,
+            receiver: bob.address,
             amount: oneToken.mul(5),
           },
         ];
 
-        // signer[0] has more voting power than signer[1]
+        // alice has more plugin power than bob
         const balanceDifference = balances[0].amount.sub(balances[1].amount);
         expect(balanceDifference).to.eq(1);
 
         await setBalances(balances);
 
-        await voting.createProposal(
+        await plugin.createProposal(
           dummyMetadata,
           dummyActions,
           0,
           0,
           0,
-          VoteOption.None,
-          false,
         );
 
-        const snapshotBlock = (await voting.getProposal(id)).parameters
+        const snapshotBlock = (await plugin.getProposal(id)).parameters
           .snapshotBlock;
-        const totalVotingPower = await voting.totalVotingPower(snapshotBlock);
+        const totalVotingPower = await plugin.totalVotingPower(snapshotBlock);
         expect(totalVotingPower).to.eq(
           balances[0].amount.add(balances[1].amount),
         );
 
         // vote with both signers
-        await voting.connect(signers[0]).vote(id, VoteOption.Yes, false);
-        await voting.connect(signers[1]).vote(id, VoteOption.No, false);
+        await plugin.connect(alice).veto(id);
+        await plugin.connect(bob).veto(id);
 
-        expect(await voting.isSupportThresholdReached(id)).to.be.true;
-        expect(await voting.isSupportThresholdReachedEarly(id)).to.be.true;
-        expect(await voting.isMinParticipationReached(id)).to.be.true;
-        expect(await voting.canExecute(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReached(id)).to.be.true;
+        expect(await plugin.isSupportThresholdReachedEarly(id)).to.be.true;
+        expect(await plugin.isMinParticipationReached(id)).to.be.true;
+        expect(await plugin.canExecute(id)).to.be.true;
       });
     });
   });

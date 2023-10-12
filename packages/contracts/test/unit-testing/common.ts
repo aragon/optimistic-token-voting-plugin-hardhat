@@ -9,9 +9,8 @@ export const ZERO_BYTES32 =
 
 export const PROPOSER_PERMISSION_ID = ethers.utils.id("PROPOSER_PERMISSION");
 export const EXECUTE_PERMISSION_ID = ethers.utils.id("EXECUTE_PERMISSION");
-export const UPDATE_VOTING_SETTINGS_PERMISSION_ID = ethers.utils.id(
-  "UPDATE_VOTING_SETTINGS_PERMISSION",
-);
+export const UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID = ethers.utils
+  .id("UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION");
 export const UPGRADE_PLUGIN_PERMISSION_ID = ethers.utils.id(
   "UPGRADE_PLUGIN_PERMISSION",
 );
@@ -22,6 +21,7 @@ export const ADDRESS_ZERO = ethers.constants.AddressZero;
 export const ADDRESS_ONE = `0x${"0".repeat(39)}1`;
 export const ADDRESS_TWO = `0x${"0".repeat(39)}2`;
 export const NO_CONDITION = ADDRESS_ZERO;
+export const ONE_WEEK = 60 * 60 * 24 * 7;
 
 export async function getTime(): Promise<number> {
   return (await ethers.provider.getBlock("latest")).timestamp;
@@ -57,21 +57,15 @@ export async function advanceAfterVoteEnd(endDate: number) {
 export const RATIO_BASE = ethers.BigNumber.from(10).pow(6); // 100% => 10**6
 export const pctToRatio = (x: number) => RATIO_BASE.mul(x).div(100);
 
-export enum VoteOption {
-  None = 0,
-  Abstain = 1,
-  Yes = 2,
-  No = 3,
-}
-
-export type VotingSettings = {
+export type OptimisticGovernanceSettings = {
   minVetoRatio: BigNumber;
   minDuration: number;
   minProposerVotingPower: number;
 };
 
-export const defaultMainVotingSettings: VotingSettings = {
-  minDuration: 60 * 60, // 1 second
-  minVetoRatio: pctToRatio(5), // 5%
-  minProposerVotingPower: 0,
-};
+export const defaultMainOptimisticGovernanceSettings:
+  OptimisticGovernanceSettings = {
+    minDuration: ONE_WEEK,
+    minVetoRatio: pctToRatio(5), // 5%
+    minProposerVotingPower: 0,
+  };

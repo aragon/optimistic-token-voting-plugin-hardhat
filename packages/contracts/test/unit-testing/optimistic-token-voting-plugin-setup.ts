@@ -1,4 +1,4 @@
-import buildMetadata from "../../src/main-voting-build-metadata.json";
+import buildMetadata from "../../src/optimistic-token-voting-build-metadata.json";
 import {
   DAO,
   OptimisticTokenVotingPlugin__factory,
@@ -14,10 +14,9 @@ import {
   EXECUTE_PERMISSION_ID,
   NO_CONDITION,
   pctToRatio,
-  UPDATE_ADDRESSES_PERMISSION_ID,
-  UPDATE_VOTING_SETTINGS_PERMISSION_ID,
+  PROPOSER_PERMISSION_ID,
+  UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID,
   UPGRADE_PLUGIN_PERMISSION_ID,
-  VotingMode,
 } from "./common";
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
 import { expect } from "chai";
@@ -35,7 +34,10 @@ describe("Main Voting Plugin Setup", function () {
 
     mainVotingPluginSetup = await new OptimisticTokenVotingPluginSetup__factory(
       alice,
-    ).deploy();
+    ).deploy(
+      governanceErc20Base,
+      governanceWrappedErc20Base,
+    );
   });
 
   describe("prepareInstallation", async () => {
@@ -49,9 +51,7 @@ describe("Main Voting Plugin Setup", function () {
         ),
         [
           {
-            votingMode: VotingMode.EarlyExecution,
-            supportThreshold: pctToRatio(25),
-            minParticipation: pctToRatio(50),
+            minVetoRatio: pctToRatio(5),
             minDuration: 60 * 60 * 24 * 5,
             minProposerVotingPower: 0,
           },
@@ -91,7 +91,7 @@ describe("Main Voting Plugin Setup", function () {
           plugin,
           dao.address,
           NO_CONDITION,
-          UPDATE_VOTING_SETTINGS_PERMISSION_ID,
+          UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID,
         ],
         [
           Operation.Grant,
@@ -171,7 +171,7 @@ describe("Main Voting Plugin Setup", function () {
           plugin,
           dao.address,
           NO_CONDITION,
-          UPDATE_VOTING_SETTINGS_PERMISSION_ID,
+          UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID,
         ],
         [
           Operation.Grant,
@@ -243,7 +243,7 @@ describe("Main Voting Plugin Setup", function () {
           plugin.address,
           dao.address,
           NO_CONDITION,
-          UPDATE_VOTING_SETTINGS_PERMISSION_ID,
+          UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID,
         ],
         [
           Operation.Revoke,
@@ -297,7 +297,7 @@ describe("Main Voting Plugin Setup", function () {
           plugin.address,
           dao.address,
           NO_CONDITION,
-          UPDATE_VOTING_SETTINGS_PERMISSION_ID,
+          UPDATE_OPTIMISTIC_GOVERNANCE_SETTINGS_PERMISSION_ID,
         ],
         [
           Operation.Revoke,
