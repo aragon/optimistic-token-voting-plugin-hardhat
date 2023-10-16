@@ -1,8 +1,4 @@
-# Thunderhead - Aragon OSx
-
-The following project contains the plugin smart contracts providing the foundation of the Thunderhead project. See `packages/contracts` and `packages/contracts-ethers`.
-
-A template for a future JS client and a Subgraph indexer is also provided but not populated at the time.
+# Optimistic token voting - Aragon OSx
 
 ## Getting started
 

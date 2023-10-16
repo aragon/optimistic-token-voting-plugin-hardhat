@@ -65,7 +65,7 @@ describe("OptimisticTokenVotingPlugin", function () {
   let governanceSettings: OptimisticGovernanceSettings;
 
   const startOffset = 20;
-  const id = 0;
+  let id = 0;
 
   before(async () => {
     signers = await ethers.getSigners();
@@ -922,6 +922,103 @@ describe("OptimisticTokenVotingPlugin", function () {
       expect(proposal.actions[0].data).to.equal(dummyActions[0].data);
     });
   });
+
+  it("should revert if vetoing twice");
+  it("should revert if vetoing before a proposal starts");
+  it("should revert if vetoing after a proposal ends");
+  it("should revert if executing before the end date");
+
+  // describe("Vetoing", () => {
+  //   beforeEach(async () => {
+  //     await setBalances([{ receiver: alice.address, amount: 10 }]);
+  //     // await setTotalSupply(10);
+
+  //     await plugin.initialize(
+  //       dao.address,
+  //       {
+  //         minVetoRatio: pctToRatio(15), // 15%
+  //         minDuration: ONE_WEEK,
+  //         minProposerVotingPower: 0,
+  //       },
+  //       governanceErc20Mock.address,
+  //     );
+
+  //     id = 0;
+  //   });
+
+  //   it("should revert if vetoing twice", async () => {
+  //     const tx = await plugin.createProposal(
+  //       dummyMetadata,
+  //       dummyActions,
+  //       0,
+  //       0,
+  //       0,
+  //     );
+  //     await tx.wait();
+
+  //     expect(await plugin.canVeto(id, alice.address)).to.be.true;
+  //     await expect(plugin.veto(id)).to.not.be.reverted;
+  //     expect(await plugin.canVeto(id, alice.address)).to.be.false;
+
+  //     await expect(plugin.veto(id)).to.be.revertedWithCustomError(
+  //       plugin,
+  //       "ProposalVetoingForbidden",
+  //     );
+  //   });
+
+  //   it("should revert if vetoing before a proposal starts", async () => {
+  //     const tx = await plugin.createProposal(
+  //       dummyMetadata,
+  //       dummyActions,
+  //       0,
+  //       startDate,
+  //       endDate,
+  //     );
+  //     await tx.wait();
+
+  //     id++;
+  //     expect(await plugin.canVeto(id, alice.address)).to.be.false;
+  //     await expect(plugin.veto(id)).to.be.revertedWithCustomError(
+  //       plugin,
+  //       "ProposalVetoingForbidden",
+  //     );
+
+  //     await advanceIntoVoteTime(startDate, endDate);
+
+  //     expect(await plugin.canVeto(id, alice.address)).to.be.true;
+  //   });
+
+  //   it("should revert if vetoing after a proposal ends", async () => {
+  //     const tx = await plugin.createProposal(
+  //       dummyMetadata,
+  //       dummyActions,
+  //       0,
+  //       startDate,
+  //       endDate,
+  //     );
+  //     await tx.wait();
+
+  //     id++;
+  //     expect(await plugin.canVeto(id, alice.address)).to.be.false;
+
+  //     await advanceIntoVoteTime(startDate, endDate);
+
+  //     expect(await plugin.canVeto(id, alice.address)).to.be.true;
+
+  //     await advanceAfterVoteEnd(endDate);
+
+  //     expect(await plugin.canVeto(id, alice.address)).to.be.false;
+
+  //     await expect(plugin.veto(id)).to.be.revertedWithCustomError(
+  //       plugin,
+  //       "ProposalVetoingForbidden",
+  //     );
+  //   });
+  // });
+
+  // describe("Executing", () => {
+  //   it("should revert if executing before the end date");
+  // });
 
   describe("Different scenarios:", async () => {
     describe("minVetoRatio is 0%", () => {
